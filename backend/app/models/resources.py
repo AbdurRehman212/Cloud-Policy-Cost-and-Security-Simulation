@@ -1,0 +1,159 @@
+from datetime import datetime
+from enum import Enum
+from app import db
+class ResourceStatus(Enum):
+    PENDING = 'pending'
+    RUNNING = 'running'
+    STOPPED = 'stopped'
+    TERMINATED = 'terminated'
+    FAILED = 'failed'
+class VirtualMachine(db.Model):
+    """Simulated Virtual Machine."""
+    __tablename__ = 'virtual_machines'
+    id = db.Column(db.Integer, primary_key=True)
+    organization_id = db.Column(db.Integer, db.ForeignKey('organizations.id'), nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+    instance_id = db.Column(db.String(50), unique=True, nullable=False)  # i-xxxxxxxx
+    instance_type = db.Column(db.String(50), nullable=False)  # t2.micro, etc.
+    status = db.Column(db.Enum(ResourceStatus), default=ResourceStatus.PENDING)
+    # Specifications
+    vcpu = db.Column(db.Integer, default=1)
+    memory_gb = db.Column(db.Float, default=1.0)
+    storage_gb = db.Column(db.Integer, default=8)
+    # Networking
+    private_ip = db.Column(db.String(15))
+    public_ip = db.Column(db.String(15))
+    subnet_id = db.Column(db.String(50))
+    vpc_id = db.Column(db.String(50))
+    # Utilization Metrics (Real-time simulated)
+    cpu_utilization = db.Column(db.Float, default=0.0)  # Percentage
+    memory_utilization = db.Column(db.Float, default=0.0)  # Percentage
+    disk_read_iops = db.Column(db.Float, default=0.0)
+    disk_write_iops = db.Column(db.Float, default=0.0)
+    network_in_mbps = db.Column(db.Float, default=0.0)
+    network_out_mbps = db.Column(db.Float, default=0.0)
+    # Metadata
+    image_id = db.Column(db.String(50))  # AMI ID
+    key_name = db.Column(db.String(100))
+    security_groups = db.Column(db.JSON, default=list)
+    tags = db.relationship('ResourceTag', backref='vm', lazy='dynamic')
+    # Timestamps
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    launched_at = db.Column(db.DateTime)
+    stopped_at = db.Column(db.DateTime)
+    terminated_at = db.Column(db.DateTime)
+    # Cost tracking
+    hourly_rate = db.Column(db.Float, nullable=False)
+    total_runtime_hours = db.Column(db.Float, default=0.0)
+    def calculate_current_cost(self):
+        """Calculate cost based on runtime."""
+        if self.status == ResourceStatus.RUNNING and self.launched_at:
+            runtime = (datetime.utcnow() - self.launched_at).total_seconds() / 3600
+            return (self.total_runtime_hours + runtime) * self.hourly_rate
+        return self.total_runtime_hours * self.hourly_rate
+    def to_dict(self):
+        return {
+            'resource_kind': 'vm',
+            'id': self.id,
+            'instance_id': self.instance_id,
+            'name': self.name,
+            'instance_type': self.instance_type,
+            'status': self.status.value if self.status else None,
+            'vcpu': self.vcpu,
+            'memory_gb': self.memory_gb,
+            'storage_gb': self.storage_gb,
+            'private_ip': self.private_ip,
+            'public_ip': self.public_ip,
+            'cpu_utilization': round(self.cpu_utilization, 2),
+            'memory_utilization': round(self.memory_utilization, 2),
+            'disk_read_iops': round(self.disk_read_iops, 2),
+            'disk_write_iops': round(self.disk_write_iops, 2),
+            'network_in_mbps': round(self.network_in_mbps, 2),
+            'network_out_mbps': round(self.network_out_mbps, 2),
+            'hourly_rate': self.hourly_rate,
+            'current_cost': round(self.calculate_current_cost(), 4),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'tags': [tag.to_dict() for tag in self.tags]
+        }
+class Database(db.Model):
+    """Simulated Database Instance."""
+    __tablename__ = 'databases'
+    id = db.Column(db.Integer, primary_key=True)
+    organization_id = db.Column(db.Integer, db.ForeignKey('organizations.id'), nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+    instance_id = db.Column(db.String(50), unique=True, nullable=False)  # db-xxxxxxxx
+    engine = db.Column(db.String(50), nullable=False)  # mysql, postgres, etc.
+    engine_version = db.Column(db.String(20))
+    instance_class = db.Column(db.String(50), nullable=False)  # db.t2.micro, etc.
+    status = db.Column(db.Enum(ResourceStatus), default=ResourceStatus.PENDING)
+    # Specifications
+    allocated_storage_gb = db.Column(db.Integer, default=20)
+    max_storage_gb = db.Column(db.Integer, default=100)
+    # Connectivity
+    endpoint = db.Column(db.String(255))
+    port = db.Column(db.Integer, default=3306)
+    master_username = db.Column(db.String(100))
+    # Security
+    publicly_accessible = db.Column(db.Boolean, default=False)
+    storage_encrypted = db.Column(db.Boolean, default=False)
+    vpc_security_groups = db.Column(db.JSON, default=list)
+    # Performance Metrics
+    cpu_utilization = db.Column(db.Float, default=0.0)
+    free_storage_space = db.Column(db.Float, default=0.0)
+    read_iops = db.Column(db.Float, default=0.0)
+    write_iops = db.Column(db.Float, default=0.0)
+    database_connections = db.Column(db.Integer, default=0)
+    # Timestamps
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    hourly_rate = db.Column(db.Float, nullable=False)
+    total_runtime_hours = db.Column(db.Float, default=0.0)
+    def to_dict(self):
+        memory_utilization = min(100.0, max(0.0, round(self.cpu_utilization * 1.35 + self.database_connections * 0.65, 2)))
+        network_in_mbps = max(0.0, round(self.database_connections * 0.75 + self.read_iops / 45, 2))
+        network_out_mbps = max(0.0, round(self.database_connections * 0.55 + self.write_iops / 55, 2))
+        disk_io_total = round(self.read_iops + self.write_iops, 2)
+        return {
+            'resource_kind': 'database',
+            'id': self.id,
+            'instance_id': self.instance_id,
+            'name': self.name,
+            'engine': self.engine,
+            'instance_class': self.instance_class,
+            'status': self.status.value if self.status else None,
+            'allocated_storage_gb': self.allocated_storage_gb,
+            'endpoint': self.endpoint,
+            'publicly_accessible': self.publicly_accessible,
+            'storage_encrypted': self.storage_encrypted,
+            'cpu_utilization': round(self.cpu_utilization, 2),
+            'memory_utilization': memory_utilization,
+            'disk_read_iops': round(self.read_iops, 2),
+            'disk_write_iops': round(self.write_iops, 2),
+            'disk_io_total': disk_io_total,
+            'network_in_mbps': network_in_mbps,
+            'network_out_mbps': network_out_mbps,
+            'database_connections': self.database_connections,
+            'hourly_rate': self.hourly_rate,
+            'current_cost': round(self.total_runtime_hours * self.hourly_rate, 4),
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+class ResourceTag(db.Model):
+    """Tags for resources."""
+    __tablename__ = 'resource_tags'
+    id = db.Column(db.Integer, primary_key=True)
+    vm_id = db.Column(db.Integer, db.ForeignKey('virtual_machines.id'))
+    db_id = db.Column(db.Integer, db.ForeignKey('databases.id'))
+    key = db.Column(db.String(128), nullable=False)
+    value = db.Column(db.String(256))
+    def to_dict(self):
+        return {'key': self.key, 'value': self.value}
+class NetworkInterface(db.Model):
+    """Network interfaces for VMs."""
+    __tablename__ = 'network_interfaces'
+    id = db.Column(db.Integer, primary_key=True)
+    vm_id = db.Column(db.Integer, db.ForeignKey('virtual_machines.id'), nullable=False)
+    network_interface_id = db.Column(db.String(50), unique=True, nullable=False)
+    subnet_id = db.Column(db.String(50))
+    vpc_id = db.Column(db.String(50))
+    private_ip = db.Column(db.String(15))
+    public_ip = db.Column(db.String(15))
+    status = db.Column(db.String(20))  # in-use, available

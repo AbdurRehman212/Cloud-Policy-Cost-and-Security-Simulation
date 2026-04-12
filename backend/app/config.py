@@ -1,0 +1,62 @@
+import os
+from datetime import timedelta
+class Config:
+    """Base configuration class."""
+    # App Settings
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-secret-key-change-in-production'
+    # Database
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///cloud_simulator.db'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    # JWT Settings
+    JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY') or 'jwt-secret-change-in-production'
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=1)
+    JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=7)
+    # Redis
+    REDIS_URL = os.environ.get('REDIS_URL') or 'redis://localhost:6379/0'
+    # Email
+    MAIL_SERVER = os.environ.get('MAIL_SERVER', 'smtp.gmail.com')
+    MAIL_PORT = int(os.environ.get('MAIL_PORT', 587))
+    MAIL_USE_TLS = os.environ.get('MAIL_USE_TLS', 'True').lower() == 'true'
+    MAIL_USERNAME = os.environ.get('MAIL_USERNAME')
+    MAIL_PASSWORD = os.environ.get('MAIL_PASSWORD')
+    MAIL_DEFAULT_SENDER = os.environ.get('MAIL_DEFAULT_SENDER')
+    # AI/ML Settings
+    MODEL_PATH = os.environ.get('MODEL_PATH') or './ai_training/models'
+    DATASET_PATH = os.environ.get('DATASET_PATH') or './data'
+    FINOPS_DATASET_PATH = os.environ.get('FINOPS_DATASET_PATH') or os.path.join(DATASET_PATH, 'finops')
+    SECURITY_DATASET_PATH = os.environ.get('SECURITY_DATASET_PATH') or os.path.join(DATASET_PATH, 'security')
+    SIMULATOR_CORE_DATASET_PATH = os.environ.get('SIMULATOR_CORE_DATASET_PATH') or os.path.join(DATASET_PATH, 'finops')
+    # Simulation Settings
+    SIMULATION_TICK_INTERVAL = int(os.environ.get('SIMULATION_TICK_INTERVAL', 5))
+    MAX_SIMULATED_RESOURCES = int(os.environ.get('MAX_SIMULATED_RESOURCES', 100))
+    DEFAULT_CURRENCY = os.environ.get('DEFAULT_CURRENCY', 'USD')
+    # Pricing (Simulated AWS-like pricing per hour)
+    VM_PRICING = {
+        't2.micro': 0.0116,
+        't2.small': 0.023,
+        't2.medium': 0.0464,
+        't2.large': 0.0928,
+        'm5.large': 0.096,
+        'm5.xlarge': 0.192,
+        'c5.large': 0.085,
+        'c5.xlarge': 0.17
+    }
+    DB_PRICING = {
+        'db.t2.micro': 0.017,
+        'db.t2.small': 0.034,
+        'db.m5.large': 0.192,
+        'db.r5.large': 0.24
+    }
+class DevelopmentConfig(Config):
+    DEBUG = True
+class ProductionConfig(Config):
+    DEBUG = False
+class TestingConfig(Config):
+    TESTING = True
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///cloud_simulator_test.db'
+config = {
+    'development': DevelopmentConfig,
+    'production': ProductionConfig,
+    'testing': TestingConfig,
+    'default': DevelopmentConfig
+}
