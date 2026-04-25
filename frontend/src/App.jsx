@@ -2,6 +2,7 @@ import React, { useEffect } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useDispatch, useSelector } from 'react-redux';
 import { fetchProfile } from './store/slices/authSlice';
+import { fetchOrganizations } from './store/slices/organizationSlice';
 import Layout from './components/Layout/Layout';
 import Login from './pages/Auth/Login';
 import Register from './pages/Auth/Register';
@@ -22,6 +23,7 @@ function App() {
   useEffect(() => {
     if (isAuthenticated) {
       dispatch(fetchProfile());
+      dispatch(fetchOrganizations());
     }
   }, [dispatch, isAuthenticated]);
   return (

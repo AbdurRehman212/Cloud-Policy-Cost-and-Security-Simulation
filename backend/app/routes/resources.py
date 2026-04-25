@@ -3,6 +3,7 @@ from flask import current_app
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db, socketio
+from app.services.resource_simulator import resource_simulator
 from app.models.resources import VirtualMachine, Database, ResourceTag, ResourceStatus
 from app.models.organization import Organization, OrganizationMember
 from app.models.governance import AuditLog
@@ -145,22 +146,25 @@ def vm_action(instance_id):
     old_status = vm.status
     if action == 'stop':
         if vm.status == ResourceStatus.RUNNING:
+            if vm.launched_at:
+                runtime = (datetime.utcnow() - vm.launched_at).total_seconds() / 3600
+                vm.total_runtime_hours += runtime
             vm.status = ResourceStatus.STOPPED
             vm.stopped_at = datetime.utcnow()
-            # Calculate runtime
-            if vm.launched_at:
-                runtime = (vm.stopped_at - vm.launched_at).total_seconds() / 3600
-                vm.total_runtime_hours += runtime
+            vm.launched_at = None
     elif action == 'start':
         if vm.status == ResourceStatus.STOPPED:
             vm.status = ResourceStatus.RUNNING
             vm.launched_at = datetime.utcnow()
+            vm.stopped_at = None
     elif action == 'terminate':
+        was_running = vm.status == ResourceStatus.RUNNING
+        if was_running and vm.launched_at:
+            runtime = (datetime.utcnow() - vm.launched_at).total_seconds() / 3600
+            vm.total_runtime_hours += runtime
         vm.status = ResourceStatus.TERMINATED
         vm.terminated_at = datetime.utcnow()
-        if vm.status == ResourceStatus.RUNNING and vm.launched_at:
-            runtime = (vm.terminated_at - vm.launched_at).total_seconds() / 3600
-            vm.total_runtime_hours += runtime
+        vm.launched_at = None
     else:
         return jsonify({'error': 'Invalid action'}), 400
     # Audit log
@@ -182,6 +186,50 @@ def vm_action(instance_id):
     return jsonify({
         'message': f'VM {action} successful',
         'vm': vm.to_dict()
+    }), 200
+@resource_bp.route('/db/<instance_id>/action', methods=['POST'])
+@jwt_required()
+def database_action(instance_id):
+    """Perform an action on a database instance (start, stop, terminate)."""
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    action = data.get('action')
+    database = Database.query.filter_by(instance_id=instance_id).first_or_404()
+    if not check_org_access(user_id, database.organization_id, 'member'):
+        return jsonify({'error': 'Access denied'}), 403
+
+    old_status = database.status
+    if action == 'stop':
+        if database.status == ResourceStatus.RUNNING:
+            database.status = ResourceStatus.STOPPED
+    elif action == 'start':
+        if database.status == ResourceStatus.STOPPED:
+            database.status = ResourceStatus.RUNNING
+    elif action == 'terminate':
+        database.status = ResourceStatus.TERMINATED
+    else:
+        return jsonify({'error': 'Invalid action'}), 400
+
+    audit = AuditLog(
+        organization_id=database.organization_id,
+        user_id=user_id,
+        action=action,
+        resource_type='database',
+        resource_id=instance_id,
+        old_values={'status': old_status.value if old_status else None},
+        new_values={'status': database.status.value if database.status else None}
+    )
+    db.session.add(audit)
+    db.session.commit()
+
+    socketio.emit('db_status_change', {
+        'instance_id': database.instance_id,
+        'status': database.status.value if database.status else None
+    }, room=f"org_{database.organization_id}")
+
+    return jsonify({
+        'message': f'Database {action} successful',
+        'database': database.to_dict()
     }), 200
 @resource_bp.route('/db', methods=['POST'])
 @jwt_required()
@@ -264,6 +312,7 @@ def get_resource_metrics():
     avg_memory = sum(vm.memory_utilization for vm in vms if vm.status == ResourceStatus.RUNNING) / running_vms if running_vms > 0 else 0
     avg_network = sum((vm.network_in_mbps + vm.network_out_mbps) for vm in vms if vm.status == ResourceStatus.RUNNING) / running_vms if running_vms > 0 else 0
     avg_db_cpu = sum(db.cpu_utilization for db in databases if db.status == ResourceStatus.RUNNING) / running_dbs if running_dbs > 0 else 0
+    simulator_snapshot = resource_simulator.get_dashboard_snapshot(org_id)
     return jsonify({
         'summary': {
             'total_vms': total_vms,
@@ -277,6 +326,9 @@ def get_resource_metrics():
             'average_network_throughput': round(avg_network, 2),
             'average_database_cpu': round(avg_db_cpu, 2),
         },
+        'cost_trend': simulator_snapshot.get('cost_trend', []),
+        'utilization_trend': simulator_snapshot.get('utilization_trend', []),
+        'recent_activity': simulator_snapshot.get('recent_activity', []),
         'vms': [vm.to_dict() for vm in vms],
         'databases': [db.to_dict() for db in databases]
     }), 200

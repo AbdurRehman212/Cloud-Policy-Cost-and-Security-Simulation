@@ -4,6 +4,7 @@ from app.models.organization import OrganizationMember
 from app.models.resources import VirtualMachine, Database, ResourceStatus
 from app.models.security import ThreatDetection
 from app.models.cost import CostRecord, Budget
+from app.services.resource_simulator import resource_simulator
 from datetime import datetime, timedelta
 dashboard_bp = Blueprint('dashboard', __name__)
 @dashboard_bp.route('/summary', methods=['GET'])
@@ -52,6 +53,7 @@ def get_dashboard_summary():
         budget_status.append(status)
     # Recent activity (last 24 hours)
     yesterday = today - timedelta(days=1)
+    simulator_snapshot = resource_simulator.get_dashboard_snapshot(org_id)
     return jsonify({
         'resources': {
             'vms': {'total': total_vms, 'running': running_vms},
@@ -65,6 +67,9 @@ def get_dashboard_summary():
             'current_month_spend': round(current_spend, 2),
             'budgets': budget_status
         },
+        'cost_trend': simulator_snapshot.get('cost_trend', []),
+        'utilization_trend': simulator_snapshot.get('utilization_trend', []),
+        'recent_activity': simulator_snapshot.get('recent_activity', []),
         'health_score': calculate_health_score(
             active_threats, running_vms, total_vms, current_spend, budgets
         )

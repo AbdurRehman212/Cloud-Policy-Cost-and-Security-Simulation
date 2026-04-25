@@ -29,7 +29,9 @@ const Sidebar = () => {
             <CloudIcon className="w-6 h-6 text-white" />
           </div>
           <div>
-            <h1 className="text-lg font-bold text-gray-900 dark:text-white">Cloud Simulator</h1>
+            <h1 className="text-lg font-bold text-gray-900 dark:text-white">
+              Cloud Policy, Cost & Security Simulator
+            </h1>
             <p className="text-xs text-gray-500 dark:text-gray-400">Digital Twin | FYP 2026</p>
           </div>
         </div>

@@ -43,7 +43,7 @@ const Register = () => {
           <div className="text-center">
             <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Create Account</h1>
             <p className="text-gray-500 dark:text-gray-400 mt-2">
-              Join the Cloud Simulator platform
+              Join the Cloud Policy, Cost & Security Simulator platform
             </p>
           </div>
           <form onSubmit={handleSubmit} className="space-y-4">

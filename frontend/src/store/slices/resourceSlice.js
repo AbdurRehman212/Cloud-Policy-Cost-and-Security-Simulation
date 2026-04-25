@@ -43,6 +43,20 @@ export const createVM = createAsyncThunk(
     }
   }
 );
+export const createDatabase = createAsyncThunk(
+  'resources/createDatabase',
+  async (data, { getState, rejectWithValue }) => {
+    try {
+      const token = getState().auth.token;
+      const response = await axios.post(`${API_URL}/resources/db`, data, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      return response.data;
+    } catch (error) {
+      return rejectWithValue(error.response?.data?.error);
+    }
+  }
+);
 export const vmAction = createAsyncThunk(
   'resources/vmAction',
   async ({ instanceId, action }, { getState, rejectWithValue }) => {
@@ -50,6 +64,22 @@ export const vmAction = createAsyncThunk(
       const token = getState().auth.token;
       const response = await axios.post(
         `${API_URL}/resources/vm/${instanceId}/action`,
+        { action },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      return response.data;
+    } catch (error) {
+      return rejectWithValue(error.response?.data?.error);
+    }
+  }
+);
+export const dbAction = createAsyncThunk(
+  'resources/dbAction',
+  async ({ instanceId, action }, { getState, rejectWithValue }) => {
+    try {
+      const token = getState().auth.token;
+      const response = await axios.post(
+        `${API_URL}/resources/db/${instanceId}/action`,
         { action },
         { headers: { Authorization: `Bearer ${token}` } }
       );
@@ -84,6 +114,9 @@ const resourceSlice = createSlice({
       })
       .addCase(createVM.fulfilled, (state, action) => {
         state.vms.push(action.payload.vm);
+      })
+      .addCase(createDatabase.fulfilled, (state, action) => {
+        state.databases.push(action.payload.database);
       });
   },
 });

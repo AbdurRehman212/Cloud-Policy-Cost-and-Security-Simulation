@@ -4,10 +4,17 @@ Cloud Policy, Cost and Security Simulator - Main Entry Point
 Final Year Project 2026
 SZABIST University Islamabad
 """
+import eventlet
+
+eventlet.monkey_patch()
+
 import os
+from dotenv import load_dotenv
 from app import create_app, db, socketio
 from app.models import *
 from app.data_sources.real_datasets import dataset_catalog
+
+load_dotenv()
 # Create app instance
 app = create_app(os.getenv('FLASK_ENV', 'development'))
 @app.shell_context_processor

@@ -3,6 +3,51 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
 from app.models.settings import UserSettings, NotificationPreference
 settings_bp = Blueprint('settings', __name__)
+
+
+def _success(data, status_code=200):
+    return jsonify({'status': 'success', 'data': data}), status_code
+
+
+def _default_settings_payload():
+    return {
+        'theme': 'light',
+        'notifications_enabled': True,
+        'dashboard': {
+            'default_organization_id': None,
+            'dashboard_layout': 'default',
+            'default_view': 'overview',
+        },
+        'appearance': {
+            'theme': 'light',
+            'language': 'en',
+            'timezone': 'Asia/Karachi',
+            'date_format': 'YYYY-MM-DD',
+        },
+        'notifications': {
+            'email': True,
+            'push': True,
+            'sms': False,
+            'preferences': {
+                'cost_alerts': True,
+                'security_alerts': True,
+                'cost_threshold': 80,
+            },
+        },
+        'security': {
+            'login_notifications': True,
+            'suspicious_activity_alerts': True,
+            'session_timeout': 60,
+        },
+    }
+
+
+@settings_bp.route('', methods=['GET'])
+def get_demo_settings():
+    """Return demo-safe settings when no authenticated profile is required."""
+    return _success(_default_settings_payload())
+
+
 @settings_bp.route('/', methods=['GET'])
 @jwt_required()
 def get_settings():
@@ -18,7 +63,7 @@ def get_settings():
         notifications = NotificationPreference(user_id=user_id)
         db.session.add(notifications)
         db.session.commit()
-    return jsonify({
+    return _success({
         'dashboard': {
             'default_organization_id': settings.default_organization_id,
             'dashboard_layout': settings.dashboard_layout,
@@ -45,7 +90,7 @@ def get_settings():
             'suspicious_activity_alerts': settings.suspicious_activity_alerts,
             'session_timeout': settings.session_timeout
         }
-    }), 200
+    })
 @settings_bp.route('/', methods=['PUT'])
 @jwt_required()
 def update_settings():
@@ -78,4 +123,4 @@ def update_settings():
         if 'push' in n:
             settings.push_notifications = n['push']
     db.session.commit()
-    return jsonify({'message': 'Settings updated'}), 200
+    return _success({'message': 'Settings updated'})

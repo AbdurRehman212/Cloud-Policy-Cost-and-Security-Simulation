@@ -25,11 +25,14 @@ class Config:
     DATASET_PATH = os.environ.get('DATASET_PATH') or './data'
     FINOPS_DATASET_PATH = os.environ.get('FINOPS_DATASET_PATH') or os.path.join(DATASET_PATH, 'finops')
     SECURITY_DATASET_PATH = os.environ.get('SECURITY_DATASET_PATH') or os.path.join(DATASET_PATH, 'security')
-    SIMULATOR_CORE_DATASET_PATH = os.environ.get('SIMULATOR_CORE_DATASET_PATH') or os.path.join(DATASET_PATH, 'finops')
+    GOVERNANCE_DATASET_PATH = os.environ.get('GOVERNANCE_DATASET_PATH') or os.path.join(DATASET_PATH, 'governance')
+    SIMULATOR_CORE_DATASET_PATH = os.environ.get('SIMULATOR_CORE_DATASET_PATH') or os.path.join(DATASET_PATH, 'simulator_core')
     # Simulation Settings
     SIMULATION_TICK_INTERVAL = int(os.environ.get('SIMULATION_TICK_INTERVAL', 5))
     MAX_SIMULATED_RESOURCES = int(os.environ.get('MAX_SIMULATED_RESOURCES', 100))
     DEFAULT_CURRENCY = os.environ.get('DEFAULT_CURRENCY', 'USD')
+    ENABLE_SIMULATION_THREADS = os.environ.get('ENABLE_SIMULATION_THREADS', 'false').lower() == 'true'
+    ENABLE_REALTIME_METRICS = os.environ.get('ENABLE_REALTIME_METRICS', 'true').lower() == 'true'
     # Pricing (Simulated AWS-like pricing per hour)
     VM_PRICING = {
         't2.micro': 0.0116,
@@ -49,8 +52,10 @@ class Config:
     }
 class DevelopmentConfig(Config):
     DEBUG = True
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DEV_DATABASE_URL') or 'sqlite:///cloud_simulator.db'
 class ProductionConfig(Config):
     DEBUG = False
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or Config.SQLALCHEMY_DATABASE_URI
 class TestingConfig(Config):
     TESTING = True
     SQLALCHEMY_DATABASE_URI = 'sqlite:///cloud_simulator_test.db'

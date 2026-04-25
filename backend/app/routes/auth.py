@@ -72,12 +72,12 @@ def send_verification_email(email, token):
     """Send email verification."""
     try:
         msg = Message(
-            'Verify Your Cloud Simulator Account',
+            'Verify Your Cloud Policy, Cost & Security Simulator Account',
             recipients=[email]
         )
         verify_url = f"http://localhost:3000/verify-email?token={token}"
         msg.body = f"""
-        Welcome to Cloud Policy, Cost and Security Simulator!
+        Welcome to Cloud Policy, Cost & Security Simulator!
         Please verify your email by clicking: {verify_url}
         This link expires in 24 hours.
         """

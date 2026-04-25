@@ -1,17 +1,31 @@
 from flask import Flask
+from flask import jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_jwt_extended import JWTManager
 from flask_cors import CORS
 from flask_mail import Mail
 from flask_socketio import SocketIO
+from werkzeug.exceptions import HTTPException
 from app.config import config
 # Initialize extensions
 db = SQLAlchemy()
 migrate = Migrate()
 jwt = JWTManager()
 mail = Mail()
-socketio = SocketIO(cors_allowed_origins="*")
+socketio = SocketIO(cors_allowed_origins="*", async_mode='eventlet')
+
+
+def _json_error(message, status_code=500, code='internal_error'):
+    return jsonify({
+        'status': 'error',
+        'error': {
+            'code': code,
+            'message': message,
+        },
+    }), status_code
+
+
 def create_app(config_name='default'):
     """Application factory pattern."""
     app = Flask(__name__)
@@ -23,6 +37,23 @@ def create_app(config_name='default'):
     mail.init_app(app)
     socketio.init_app(app)
     CORS(app, resources={r"/api/*": {"origins": "*"}})
+    from app.utils.dataset_loader import load_dataset
+
+    load_dataset()
+
+    @app.errorhandler(HTTPException)
+    def handle_http_error(error):
+        return _json_error(
+            error.description or error.name,
+            status_code=error.code or 500,
+            code=error.name.lower().replace(' ', '_'),
+        )
+
+    @app.errorhandler(Exception)
+    def handle_unexpected_error(error):
+        app.logger.exception('Unhandled application error')
+        return _json_error('Internal server error', status_code=500, code='internal_error')
+
     # Register blueprints
     from app.routes.auth import auth_bp
     from app.routes.organization import org_bp
@@ -35,6 +66,8 @@ def create_app(config_name='default'):
     from app.routes.dashboard import dashboard_bp
     from app.routes.assistant import assistant_bp
     from app.routes.membership import membership_bp
+    from app.routes.simulation_routes import simulation_bp
+    app.register_blueprint(simulation_bp, url_prefix='/api')
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(org_bp, url_prefix='/api/org')
     app.register_blueprint(resource_bp, url_prefix='/api/resources')
@@ -49,4 +82,12 @@ def create_app(config_name='default'):
     # Create database tables
     with app.app_context():
         db.create_all()
+        if app.config.get('ENABLE_REALTIME_METRICS') and not app.config.get('TESTING'):
+            from app.services.metrics_streamer import metrics_streamer
+
+            metrics_streamer.start()
+        if app.config.get('ENABLE_SIMULATION_THREADS') and not app.config.get('TESTING'):
+            from app.services.resource_simulator import resource_simulator
+
+            resource_simulator.start(app)
     return app

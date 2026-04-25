@@ -116,7 +116,7 @@ def invite_member(org_id):
         invite_url = f"http://localhost:3000/accept-invite?token={invitation.token}"
         inviter = User.query.get(user_id)
         msg.body = f"""
-        You've been invited to join {org.name} on Cloud Simulator.
+        You've been invited to join {org.name} on Cloud Policy, Cost & Security Simulator.
         Invited by: {inviter.first_name} {inviter.last_name}
         Role: {role}
         Accept invitation: {invite_url}

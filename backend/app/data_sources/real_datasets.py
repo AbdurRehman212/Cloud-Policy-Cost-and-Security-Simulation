@@ -46,12 +46,14 @@ class RealDatasetCatalog:
 
     finops_path: Path = Path(Config.FINOPS_DATASET_PATH)
     security_path: Path = Path(Config.SECURITY_DATASET_PATH)
+    governance_path: Path = Path(Config.GOVERNANCE_DATASET_PATH)
     simulator_core_path: Path = Path(Config.SIMULATOR_CORE_DATASET_PATH)
 
     def list_available_files(self) -> dict[str, list[str]]:
         return {
             'finops': [str(path) for path in _discover_tabular_files(self.finops_path)],
             'security': [str(path) for path in _discover_tabular_files(self.security_path)],
+            'governance': [str(path) for path in _discover_tabular_files(self.governance_path)],
             'simulator_core': [str(path) for path in _discover_tabular_files(self.simulator_core_path)],
         }
 
@@ -60,6 +62,9 @@ class RealDatasetCatalog:
 
     def load_security_frame(self) -> pd.DataFrame:
         return self._load_frame(self.security_path)
+
+    def load_governance_frame(self) -> pd.DataFrame:
+        return self._load_frame(self.governance_path)
 
     def load_simulator_core_frame(self) -> pd.DataFrame:
         return self._load_frame(self.simulator_core_path)

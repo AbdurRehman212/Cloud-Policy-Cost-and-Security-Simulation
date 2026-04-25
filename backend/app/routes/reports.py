@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify, send_file
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from app.models.organization import OrganizationMember
+from app.models.organization import Organization, OrganizationMember
 from app.models.cost import CostRecord
 from app.models.security import ThreatDetection
 from io import BytesIO, StringIO
@@ -11,6 +11,18 @@ from reportlab.lib.styles import getSampleStyleSheet
 from datetime import datetime
 import pandas as pd
 reports_bp = Blueprint('reports', __name__)
+
+
+def infer_plan(max_resources):
+    if max_resources is None:
+        return 'starter'
+    if max_resources >= 200:
+        return 'enterprise'
+    if max_resources >= 100:
+        return 'pro'
+    return 'starter'
+
+
 @reports_bp.route('/generate', methods=['POST'])
 @jwt_required()
 def generate_report():
@@ -28,14 +40,41 @@ def generate_report():
     styles = getSampleStyleSheet()
     story = []
     # Title
-    title = Paragraph(f"Cloud Simulator - {report_type.title()} Report", styles['Heading1'])
+    title = Paragraph(
+        f"Cloud Policy, Cost & Security Simulator - {report_type.title()} Report",
+        styles['Heading1']
+    )
     story.append(title)
     story.append(Spacer(1, 12))
     # Date
     date_para = Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles['Normal'])
     story.append(date_para)
     story.append(Spacer(1, 12))
-    if report_type == 'cost':
+    org = Organization.query.get(org_id)
+    if report_type == 'summary':
+        summary_rows = [
+            ['Organization', org.name if org else f'Organization #{org_id}'],
+            ['Plan', infer_plan(org.max_resources) if org else 'starter'],
+            ['Member Count', str(len(org.members)) if org else '0'],
+            ['Resource Count', str((len(org.resources) + len(org.databases)) if org else 0)],
+            ['Active Threats', str(ThreatDetection.query.filter_by(organization_id=org_id, status='active').count())],
+            ['Current Month Spend', f"${sum(c.total_cost for c in CostRecord.query.filter_by(organization_id=org_id).all()):.2f}"],
+        ]
+        summary_table = Table([['Metric', 'Value']] + summary_rows)
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        story.append(summary_table)
+        story.append(Spacer(1, 12))
+        story.append(Paragraph(
+            'This report summarizes the simulator status, cost posture, and threat activity for the selected organization.',
+            styles['BodyText']
+        ))
+    elif report_type == 'cost':
         # Cost summary table
         costs = CostRecord.query.filter_by(organization_id=org_id).all()
         cost_data = [['Date', 'Service', 'Amount']] + \

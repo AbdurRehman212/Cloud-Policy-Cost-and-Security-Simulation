@@ -1,11 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
-import { fetchVMs, fetchDatabases, createVM, vmAction } from '../../store/slices/resourceSlice';
+import {
+  fetchVMs,
+  fetchDatabases,
+  createVM,
+  createDatabase,
+  vmAction,
+  dbAction,
+} from '../../store/slices/resourceSlice';
 import {
   PlusIcon,
   PlayIcon,
   StopIcon,
   TrashIcon,
+  CircleStackIcon,
   ServerIcon,
 } from '@heroicons/react/24/outline';
 import toast from 'react-hot-toast';
@@ -14,15 +22,30 @@ const Resources = () => {
   const { currentOrganization } = useSelector((state) => state.organization);
   const { vms, databases } = useSelector((state) => state.resources);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showCreateDatabaseModal, setShowCreateDatabaseModal] = useState(false);
   const [newVM, setNewVM] = useState({
     name: '',
     instance_type: 't2.micro',
+    organization_id: currentOrganization?.id,
+  });
+  const [newDatabase, setNewDatabase] = useState({
+    name: '',
+    engine: 'postgres',
+    instance_class: 'db.t2.small',
+    allocated_storage_gb: 20,
+    publicly_accessible: false,
+    storage_encrypted: true,
     organization_id: currentOrganization?.id,
   });
   useEffect(() => {
     if (currentOrganization) {
       dispatch(fetchVMs(currentOrganization.id));
       dispatch(fetchDatabases(currentOrganization.id));
+      const refresh = setInterval(() => {
+        dispatch(fetchVMs(currentOrganization.id));
+        dispatch(fetchDatabases(currentOrganization.id));
+      }, 10000);
+      return () => clearInterval(refresh);
     }
   }, [dispatch, currentOrganization]);
   const handleCreateVM = async (e) => {
@@ -37,10 +60,42 @@ const Resources = () => {
       setNewVM({ name: '', instance_type: 't2.micro', organization_id: currentOrganization?.id });
     }
   };
+  const handleCreateDatabase = async (e) => {
+    e.preventDefault();
+    const result = await dispatch(createDatabase({
+      ...newDatabase,
+      organization_id: currentOrganization.id,
+      allocated_storage_gb: Number(newDatabase.allocated_storage_gb),
+    }));
+    if (result.meta.requestStatus === 'fulfilled') {
+      toast.success('Database created successfully');
+      setShowCreateDatabaseModal(false);
+      setNewDatabase({
+        name: '',
+        engine: 'postgres',
+        instance_class: 'db.t2.small',
+        allocated_storage_gb: 20,
+        publicly_accessible: false,
+        storage_encrypted: true,
+        organization_id: currentOrganization?.id,
+      });
+      dispatch(fetchDatabases(currentOrganization.id));
+    }
+  };
   const handleAction = async (instanceId, action) => {
     const result = await dispatch(vmAction({ instanceId, action }));
     if (result.meta.requestStatus === 'fulfilled') {
       toast.success(`VM ${action}d successfully`);
+      dispatch(fetchVMs(currentOrganization.id));
+      dispatch(fetchDatabases(currentOrganization.id));
+    }
+  };
+  const handleDatabaseAction = async (instanceId, action) => {
+    const result = await dispatch(dbAction({ instanceId, action }));
+    if (result.meta.requestStatus === 'fulfilled') {
+      toast.success(`Database ${action}d successfully`);
+      dispatch(fetchVMs(currentOrganization.id));
+      dispatch(fetchDatabases(currentOrganization.id));
     }
   };
   const instanceTypes = [
@@ -53,13 +108,22 @@ const Resources = () => {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Resources</h1>
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="btn-primary flex items-center space-x-2"
-        >
-          <PlusIcon className="w-5 h-5" />
-          <span>Create VM</span>
-        </button>
+        <div className="flex items-center space-x-3">
+          <button
+            onClick={() => setShowCreateDatabaseModal(true)}
+            className="btn-secondary flex items-center space-x-2"
+          >
+            <CircleStackIcon className="w-5 h-5" />
+            <span>Create DB</span>
+          </button>
+          <button
+            onClick={() => setShowCreateModal(true)}
+            className="btn-primary flex items-center space-x-2"
+          >
+            <PlusIcon className="w-5 h-5" />
+            <span>Create VM</span>
+          </button>
+        </div>
       </div>
       {/* Resources Table */}
       <div className="card overflow-hidden">
@@ -189,6 +253,7 @@ const Resources = () => {
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">CPU / Memory</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Disk / Network</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Cost</th>
+                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
@@ -225,11 +290,37 @@ const Resources = () => {
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
                     ${database.current_cost.toFixed(4)}
                   </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                    <div className="flex items-center justify-end space-x-2">
+                      {database.status === 'stopped' && (
+                        <button
+                          onClick={() => handleDatabaseAction(database.instance_id, 'start')}
+                          className="text-success-600 hover:text-success-900"
+                        >
+                          <PlayIcon className="w-5 h-5" />
+                        </button>
+                      )}
+                      {database.status === 'running' && (
+                        <button
+                          onClick={() => handleDatabaseAction(database.instance_id, 'stop')}
+                          className="text-warning-600 hover:text-warning-900"
+                        >
+                          <StopIcon className="w-5 h-5" />
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleDatabaseAction(database.instance_id, 'terminate')}
+                        className="text-danger-600 hover:text-danger-900"
+                      >
+                        <TrashIcon className="w-5 h-5" />
+                      </button>
+                    </div>
+                  </td>
                 </tr>
               ))}
               {databases.length === 0 && (
                 <tr>
-                  <td colSpan="7" className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">
+                  <td colSpan="8" className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">
                     No databases have been created yet.
                   </td>
                 </tr>
@@ -285,6 +376,104 @@ const Resources = () => {
                 </button>
                 <button type="submit" className="btn-primary">
                   Create VM
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {/* Create Database Modal */}
+      {showCreateDatabaseModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-xl p-6 w-full max-w-md mx-4">
+            <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-4">
+              Create Database
+            </h2>
+            <form onSubmit={handleCreateDatabase} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  Database Name
+                </label>
+                <input
+                  type="text"
+                  required
+                  className="input-field"
+                  value={newDatabase.name}
+                  onChange={(e) => setNewDatabase({ ...newDatabase, name: e.target.value })}
+                  placeholder="e.g., analytics-db"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  Engine
+                </label>
+                <select
+                  className="input-field"
+                  value={newDatabase.engine}
+                  onChange={(e) => setNewDatabase({ ...newDatabase, engine: e.target.value })}
+                >
+                  <option value="postgres">PostgreSQL</option>
+                  <option value="mysql">MySQL</option>
+                  <option value="mariadb">MariaDB</option>
+                  <option value="mongodb">MongoDB</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  Instance Class
+                </label>
+                <select
+                  className="input-field"
+                  value={newDatabase.instance_class}
+                  onChange={(e) => setNewDatabase({ ...newDatabase, instance_class: e.target.value })}
+                >
+                  <option value="db.t2.micro">db.t2.micro</option>
+                  <option value="db.t2.small">db.t2.small</option>
+                  <option value="db.m5.large">db.m5.large</option>
+                  <option value="db.r5.large">db.r5.large</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  Allocated Storage (GB)
+                </label>
+                <input
+                  type="number"
+                  min="20"
+                  required
+                  className="input-field"
+                  value={newDatabase.allocated_storage_gb}
+                  onChange={(e) => setNewDatabase({ ...newDatabase, allocated_storage_gb: e.target.value })}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="flex items-center space-x-2 text-sm text-gray-700 dark:text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={newDatabase.publicly_accessible}
+                    onChange={(e) => setNewDatabase({ ...newDatabase, publicly_accessible: e.target.checked })}
+                  />
+                  <span>Public access</span>
+                </label>
+                <label className="flex items-center space-x-2 text-sm text-gray-700 dark:text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={newDatabase.storage_encrypted}
+                    onChange={(e) => setNewDatabase({ ...newDatabase, storage_encrypted: e.target.checked })}
+                  />
+                  <span>Encrypted</span>
+                </label>
+              </div>
+              <div className="flex justify-end space-x-3 pt-4">
+                <button
+                  type="button"
+                  onClick={() => setShowCreateDatabaseModal(false)}
+                  className="btn-secondary"
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="btn-primary">
+                  Create Database
                 </button>
               </div>
             </form>
