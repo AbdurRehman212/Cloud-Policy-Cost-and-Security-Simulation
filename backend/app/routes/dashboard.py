@@ -13,6 +13,7 @@ def get_dashboard_summary():
     """Get dashboard summary data."""
     user_id = get_jwt_identity()
     org_id = request.args.get('organization_id', type=int)
+    use_resource_metrics = (request.args.get('use_resource_metrics', '') or '').strip().lower() in {'1', 'true', 'yes'}
     member = OrganizationMember.query.filter_by(organization_id=org_id, user_id=user_id).first()
     if not member:
         return jsonify({'error': 'Access denied'}), 403
@@ -54,6 +55,41 @@ def get_dashboard_summary():
     # Recent activity (last 24 hours)
     yesterday = today - timedelta(days=1)
     simulator_snapshot = resource_simulator.get_dashboard_snapshot(org_id)
+
+    if use_resource_metrics:
+        from app.routes.resources import RESOURCES, _RESOURCE_LOCK
+
+        with _RESOURCE_LOCK:
+            scoped_resources = [
+                resource for resource in RESOURCES
+                if resource.get('org_id') == org_id and resource.get('id')
+            ]
+
+        vm_resources = [resource for resource in scoped_resources if resource.get('type') != 'database']
+        db_resources = [resource for resource in scoped_resources if resource.get('type') == 'database']
+        running_resources = [resource for resource in scoped_resources if resource.get('status') == 'running']
+        avg_cpu = (
+            sum(float(resource.get('cpu', 0.0)) for resource in running_resources) / len(running_resources)
+            if running_resources else 0.0
+        )
+        avg_memory = (
+            sum(float(resource.get('memory', 0.0)) for resource in running_resources) / len(running_resources)
+            if running_resources else 0.0
+        )
+
+        total_vms = len(vm_resources)
+        running_vms = sum(1 for resource in vm_resources if resource.get('status') == 'running')
+        total_dbs = len(db_resources)
+        running_dbs = sum(1 for resource in db_resources if resource.get('status') == 'running')
+        simulator_snapshot = {
+            **simulator_snapshot,
+            'utilization_trend': [{
+                'timestamp': datetime.utcnow().isoformat(),
+                'cpu_avg': round(avg_cpu * 100, 2),
+                'memory_avg': round(avg_memory * 100, 2),
+            }],
+        }
+
     return jsonify({
         'resources': {
             'vms': {'total': total_vms, 'running': running_vms},

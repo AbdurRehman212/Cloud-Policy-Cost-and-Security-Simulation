@@ -2,10 +2,24 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import create_access_token, create_refresh_token, jwt_required, get_jwt_identity
 from app import db, mail
 from app.models.user import User, UserProfile, EmailVerification
+from app.models.settings import UserSettings
+from app.models.organization import ensure_default_organization_membership
 from flask_mail import Message
 import re
 from datetime import datetime
 auth_bp = Blueprint('auth', __name__)
+
+DEMO_EMAIL_VERIFICATION_BYPASS = True
+
+
+def _success(data, status_code=200):
+    return jsonify({'status': 'success', 'data': data}), status_code
+
+
+def _error(message, status_code=400):
+    return jsonify({'status': 'error', 'error': {'message': message}}), status_code
+
+
 def is_valid_email(email):
     """Validate email format."""
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
@@ -24,26 +38,29 @@ def is_valid_password(password):
 @auth_bp.route('/register', methods=['POST'])
 def register():
     """Register new user."""
-    data = request.get_json()
+    data = request.get_json() or {}
     # Validation
     required = ['email', 'password', 'first_name', 'last_name']
     for field in required:
         if not data.get(field):
-            return jsonify({'error': f'{field} is required'}), 400
+            return _error(f'{field} is required', status_code=400)
     email = data['email'].lower().strip()
     if not is_valid_email(email):
-        return jsonify({'error': 'Invalid email format'}), 400
+        return _error('Invalid email format', status_code=400)
     valid_pwd, msg = is_valid_password(data['password'])
     if not valid_pwd:
-        return jsonify({'error': msg}), 400
+        return _error(msg, status_code=400)
     if User.query.filter_by(email=email).first():
-        return jsonify({'error': 'Email already registered'}), 409
+        return _error('Email already registered', status_code=409)
     try:
         # Create user
         user = User(
             email=email,
             first_name=data['first_name'],
-            last_name=data['last_name']
+            last_name=data['last_name'],
+            # Email verification bypassed for demo; production uses external email service
+            is_active=DEMO_EMAIL_VERIFICATION_BYPASS,
+            email_verified=DEMO_EMAIL_VERIFICATION_BYPASS,
         )
         user.set_password(data['password'])
         db.session.add(user)
@@ -52,22 +69,30 @@ def register():
         profile = UserProfile(user_id=user.id)
         db.session.add(profile)
         # Create settings
-        from app.models.settings import UserSettings
         settings = UserSettings(user_id=user.id)
         db.session.add(settings)
-        # Create verification token
-        verification = EmailVerification.create_token(user.id)
-        db.session.add(verification)
+
+        # Ensure every user starts with a valid owner membership for demo stability.
+        ensure_default_organization_membership(user)
+
+        verification = None
+        if not DEMO_EMAIL_VERIFICATION_BYPASS:
+            verification = EmailVerification.create_token(user.id)
+            db.session.add(verification)
+
         db.session.commit()
-        # Send verification email
-        send_verification_email(user.email, verification.token)
-        return jsonify({
-            'message': 'Registration successful. Please check your email to verify your account.',
-            'user': user.to_dict()
-        }), 201
+
+        if verification is not None:
+            send_verification_email(user.email, verification.token)
+
+        payload = {
+            'message': 'Registration successful. You can now log in.' if DEMO_EMAIL_VERIFICATION_BYPASS else 'Registration successful. Please check your email to verify your account.',
+            'user': user.to_dict(),
+        }
+        return _success(payload, status_code=201)
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': 'Registration failed', 'details': str(e)}), 500
+        return _error(f'Registration failed: {e}', status_code=500)
 def send_verification_email(email, token):
     """Send email verification."""
     try:
@@ -89,70 +114,83 @@ def verify_email():
     """Verify email with token."""
     token = request.args.get('token')
     if not token:
-        return jsonify({'error': 'Token required'}), 400
+        return _error('Token required', status_code=400)
     verification = EmailVerification.query.filter_by(token=token, used=False).first()
     if not verification:
-        return jsonify({'error': 'Invalid or used token'}), 400
+        return _error('Invalid or used token', status_code=400)
     if verification.is_expired():
-        return jsonify({'error': 'Token expired'}), 400
+        return _error('Token expired', status_code=400)
     user = User.query.get(verification.user_id)
     user.email_verified = True
     user.is_active = True
     verification.used = True
     db.session.commit()
-    return jsonify({'message': 'Email verified successfully. You can now log in.'}), 200
+    return _success({'message': 'Email verified successfully. You can now log in.'})
 @auth_bp.route('/login', methods=['POST'])
 def login():
     """User login."""
-    data = request.get_json()
+    data = request.get_json() or {}
     email = data.get('email', '').lower().strip()
     password = data.get('password')
     if not email or not password:
-        return jsonify({'error': 'Email and password required'}), 400
+        return _error('Email and password required', status_code=400)
     user = User.query.filter_by(email=email).first()
     if not user or not user.check_password(password):
-        return jsonify({'error': 'Invalid credentials'}), 401
-    if not user.is_active:
-        return jsonify({'error': 'Account not activated. Please verify your email.'}), 403
+        return _error('Invalid credentials', status_code=401)
+
+    if DEMO_EMAIL_VERIFICATION_BYPASS and (not user.is_active or not user.email_verified):
+        user.is_active = True
+        user.email_verified = True
+    elif not user.is_active:
+        return _error('Account not activated. Please verify your email.', status_code=403)
+
+    ensure_default_organization_membership(user)
+
     # Update last login
     user.last_login = datetime.utcnow()
     db.session.commit()
     # Create tokens
     access_token = create_access_token(identity=user.id)
     refresh_token = create_refresh_token(identity=user.id)
-    return jsonify({
+
+    payload = {
         'access_token': access_token,
         'refresh_token': refresh_token,
         'user': user.to_dict()
-    }), 200
+    }
+    return _success(payload)
 @auth_bp.route('/refresh', methods=['POST'])
 @jwt_required(refresh=True)
 def refresh():
     """Refresh access token."""
     user_id = get_jwt_identity()
     access_token = create_access_token(identity=user_id)
-    return jsonify({'access_token': access_token}), 200
+    return _success({'access_token': access_token})
 @auth_bp.route('/profile', methods=['GET'])
 @jwt_required()
 def get_profile():
     """Get user profile."""
     user_id = get_jwt_identity()
-    user = User.query.get_or_404(user_id)
-    return jsonify({
+    user = User.query.get(user_id)
+    if not user:
+        return _error('User not found', status_code=404)
+    return _success({
         'user': user.to_dict(),
         'profile': {
             'phone': user.profile.phone if user.profile else None,
             'department': user.profile.department if user.profile else None,
             'job_title': user.profile.job_title if user.profile else None
         }
-    }), 200
+    })
 @auth_bp.route('/profile', methods=['PUT'])
 @jwt_required()
 def update_profile():
     """Update user profile."""
     user_id = get_jwt_identity()
-    user = User.query.get_or_404(user_id)
-    data = request.get_json()
+    user = User.query.get(user_id)
+    if not user:
+        return _error('User not found', status_code=404)
+    data = request.get_json() or {}
     if 'first_name' in data:
         user.first_name = data['first_name']
     if 'last_name' in data:
@@ -165,11 +203,12 @@ def update_profile():
         if 'job_title' in data:
             user.profile.job_title = data['job_title']
     db.session.commit()
-    return jsonify({'message': 'Profile updated', 'user': user.to_dict()}), 200
+    return _success({'message': 'Profile updated', 'user': user.to_dict()})
 @auth_bp.route('/forgot-password', methods=['POST'])
 def forgot_password():
     """Request password reset."""
-    email = request.json.get('email')
+    payload = request.get_json() or {}
+    email = payload.get('email')
     user = User.query.filter_by(email=email).first()
     if user:
         # Generate reset token
@@ -186,19 +225,21 @@ def forgot_password():
         except:
             pass
     # Always return success to prevent email enumeration
-    return jsonify({'message': 'If email exists, reset instructions sent'}), 200
+    return _success({'message': 'If email exists, reset instructions sent'})
 @auth_bp.route('/change-password', methods=['POST'])
 @jwt_required()
 def change_password():
     """Change password."""
     user_id = get_jwt_identity()
-    user = User.query.get_or_404(user_id)
-    data = request.get_json()
+    user = User.query.get(user_id)
+    if not user:
+        return _error('User not found', status_code=404)
+    data = request.get_json() or {}
     if not user.check_password(data.get('current_password')):
-        return jsonify({'error': 'Current password incorrect'}), 400
+        return _error('Current password incorrect', status_code=400)
     valid, msg = is_valid_password(data.get('new_password'))
     if not valid:
-        return jsonify({'error': msg}), 400
+        return _error(msg, status_code=400)
     user.set_password(data['new_password'])
     db.session.commit()
-    return jsonify({'message': 'Password changed successfully'}), 200
+    return _success({'message': 'Password changed successfully'})

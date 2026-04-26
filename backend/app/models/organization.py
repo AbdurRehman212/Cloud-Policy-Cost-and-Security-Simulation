@@ -87,3 +87,42 @@ class Invitation(db.Model):
             invited_by=invited_by,
             expires_at=expires
         )
+
+
+def ensure_default_organization_membership(user):
+    """Ensure a user has at least one organization membership.
+
+    Returns a tuple of (organization, membership, created_new).
+    This helper does not commit; callers control the transaction boundary.
+    """
+    existing_membership = (
+        OrganizationMember.query
+        .filter_by(user_id=user.id)
+        .order_by(OrganizationMember.joined_at.asc(), OrganizationMember.id.asc())
+        .first()
+    )
+    if existing_membership and existing_membership.organization:
+        if not existing_membership.role:
+            existing_membership.role = 'owner'
+        return existing_membership.organization, existing_membership, False
+
+    org_name = f"{(user.first_name or 'Demo').strip()} Demo Organization"
+    organization = Organization(
+        name=org_name,
+        description='Auto-created default organization for demo onboarding.',
+        owner_id=user.id,
+        billing_email=user.email,
+        max_resources=100,
+    )
+    organization.slug = organization.generate_slug()
+    db.session.add(organization)
+    db.session.flush()
+
+    membership = OrganizationMember(
+        organization_id=organization.id,
+        user_id=user.id,
+        role='owner',
+    )
+    db.session.add(membership)
+
+    return organization, membership, True

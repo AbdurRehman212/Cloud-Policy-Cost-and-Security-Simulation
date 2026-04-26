@@ -11,6 +11,8 @@ def _success(data, status_code=200):
 
 def _default_settings_payload():
     return {
+        'email_enabled': False,
+        'demo_mode': True,
         'theme': 'light',
         'notifications_enabled': True,
         'dashboard': {
@@ -64,6 +66,8 @@ def get_settings():
         db.session.add(notifications)
         db.session.commit()
     return _success({
+        'email_enabled': False,
+        'demo_mode': True,
         'dashboard': {
             'default_organization_id': settings.default_organization_id,
             'dashboard_layout': settings.dashboard_layout,

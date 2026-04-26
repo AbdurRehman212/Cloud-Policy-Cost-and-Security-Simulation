@@ -9,9 +9,9 @@ export const fetchOrganizations = createAsyncThunk(
       const response = await axios.get(`${API_URL}/org/`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return response.data.organizations;
+      return response?.data?.data?.organizations || [];
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error);
+      return rejectWithValue(error?.response?.data?.error?.message || 'Failed to load organizations');
     }
   }
 );
@@ -23,9 +23,9 @@ export const createOrganization = createAsyncThunk(
       const response = await axios.post(`${API_URL}/org/`, data, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return response.data;
+      return response?.data?.data || {};
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error);
+      return rejectWithValue(error?.response?.data?.error?.message || 'Failed to create organization');
     }
   }
 );

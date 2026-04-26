@@ -32,7 +32,7 @@ const Register = () => {
     }
     const result = await dispatch(register(formData));
     if (result.meta.requestStatus === 'fulfilled') {
-      toast.success('Registration successful! Please check your email to verify your account.');
+      toast.success('Registration successful! You can now sign in.');
       navigate('/login');
     }
   };

@@ -1,18 +1,26 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
-from app.models.organization import Organization, OrganizationMember, Invitation
+from app.models.organization import Organization, OrganizationMember, Invitation, ensure_default_organization_membership
 from app.models.user import User
 from datetime import datetime
 org_bp = Blueprint('organization', __name__)
+
+
+def _success(data, status_code=200):
+    return jsonify({'status': 'success', 'data': data}), status_code
+
+
+def _error(message, status_code=400):
+    return jsonify({'status': 'error', 'error': {'message': message}}), status_code
 @org_bp.route('/', methods=['POST'])
 @jwt_required()
 def create_organization():
     """Create new organization."""
     user_id = get_jwt_identity()
-    data = request.get_json()
+    data = request.get_json() or {}
     if not data.get('name'):
-        return jsonify({'error': 'Organization name required'}), 400
+        return _error('Organization name required', status_code=400)
     org = Organization(
         name=data['name'],
         description=data.get('description', ''),
@@ -30,36 +38,46 @@ def create_organization():
     )
     db.session.add(member)
     db.session.commit()
-    return jsonify({
+    return _success({
         'message': 'Organization created',
         'organization': org.to_dict()
-    }), 201
+    }, status_code=201)
 @org_bp.route('/', methods=['GET'])
 @jwt_required()
 def list_organizations():
     """List user's organizations."""
     user_id = get_jwt_identity()
     memberships = OrganizationMember.query.filter_by(user_id=user_id).all()
+
+    if not memberships:
+        user = User.query.get(user_id)
+        if user:
+            ensure_default_organization_membership(user)
+            db.session.commit()
+            memberships = OrganizationMember.query.filter_by(user_id=user_id).all()
+
     orgs = []
     for membership in memberships:
         org = membership.organization
         org_data = org.to_dict()
         org_data['my_role'] = membership.role
         orgs.append(org_data)
-    return jsonify({'organizations': orgs}), 200
+    return _success({'organizations': orgs})
 @org_bp.route('/<int:org_id>', methods=['GET'])
 @jwt_required()
 def get_organization(org_id):
     """Get organization details."""
     user_id = get_jwt_identity()
-    org = Organization.query.get_or_404(org_id)
+    org = Organization.query.get(org_id)
+    if not org:
+        return _error('Organization not found', status_code=404)
     # Check membership
     member = OrganizationMember.query.filter_by(
         organization_id=org_id,
         user_id=user_id
     ).first()
     if not member:
-        return jsonify({'error': 'Access denied'}), 403
+        return _error('Access denied', status_code=403)
     data = org.to_dict()
     data['my_role'] = member.role
     # Get members
@@ -73,7 +91,7 @@ def get_organization(org_id):
             'joined_at': m.joined_at.isoformat() if m.joined_at else None
         })
     data['members'] = members
-    return jsonify(data), 200
+    return _success(data)
 @org_bp.route('/<int:org_id>/invite', methods=['POST'])
 @jwt_required()
 def invite_member(org_id):
@@ -85,12 +103,12 @@ def invite_member(org_id):
         user_id=user_id
     ).first()
     if not member or member.role not in ['owner', 'admin']:
-        return jsonify({'error': 'Insufficient permissions'}), 403
-    data = request.get_json()
+        return _error('Insufficient permissions', status_code=403)
+    data = request.get_json() or {}
     email = data.get('email', '').lower().strip()
     role = data.get('role', 'member')
     if role not in ['admin', 'member', 'viewer']:
-        return jsonify({'error': 'Invalid role'}), 400
+        return _error('Invalid role', status_code=400)
     # Check if already member
     existing_user = User.query.filter_by(email=email).first()
     if existing_user:
@@ -99,7 +117,7 @@ def invite_member(org_id):
             user_id=existing_user.id
         ).first()
         if existing_member:
-            return jsonify({'error': 'User already member'}), 409
+            return _error('User already member', status_code=409)
     # Create invitation
     invitation = Invitation.create_invitation(org_id, email, role, user_id)
     db.session.add(invitation)
@@ -125,28 +143,29 @@ def invite_member(org_id):
         mail.send(msg)
     except Exception as e:
         print(f"Failed to send invite: {e}")
-    return jsonify({
+    return _success({
         'message': 'Invitation sent',
         'invitation': {
             'email': email,
             'role': role,
             'expires_at': invitation.expires_at.isoformat()
         }
-    }), 201
+    }, status_code=201)
 @org_bp.route('/accept-invite', methods=['POST'])
 @jwt_required()
 def accept_invitation():
     """Accept invitation."""
     user_id = get_jwt_identity()
-    token = request.json.get('token')
+    data = request.get_json() or {}
+    token = data.get('token')
     invitation = Invitation.query.filter_by(token=token, accepted=False).first()
     if not invitation:
-        return jsonify({'error': 'Invalid invitation'}), 400
+        return _error('Invalid invitation', status_code=400)
     if invitation.expires_at < datetime.utcnow():
-        return jsonify({'error': 'Invitation expired'}), 400
+        return _error('Invitation expired', status_code=400)
     user = User.query.get(user_id)
     if user.email.lower() != invitation.email.lower():
-        return jsonify({'error': 'Invitation email mismatch'}), 403
+        return _error('Invitation email mismatch', status_code=403)
     # Add to organization
     member = OrganizationMember(
         organization_id=invitation.organization_id,
@@ -156,10 +175,10 @@ def accept_invitation():
     invitation.accepted = True
     db.session.add(member)
     db.session.commit()
-    return jsonify({
+    return _success({
         'message': 'Joined organization successfully',
         'organization_id': invitation.organization_id
-    }), 200
+    })
 @org_bp.route('/<int:org_id>/members/<int:member_id>', methods=['DELETE'])
 @jwt_required()
 def remove_member(org_id, member_id):
@@ -171,13 +190,15 @@ def remove_member(org_id, member_id):
         user_id=user_id
     ).first()
     if not current_member or current_member.role not in ['owner', 'admin']:
-        return jsonify({'error': 'Insufficient permissions'}), 403
-    target_member = OrganizationMember.query.get_or_404(member_id)
+        return _error('Insufficient permissions', status_code=403)
+    target_member = OrganizationMember.query.get(member_id)
+    if not target_member:
+        return _error('Member not found', status_code=404)
     if target_member.organization_id != org_id:
-        return jsonify({'error': 'Member not in organization'}), 400
+        return _error('Member not in organization', status_code=400)
     # Cannot remove owner
     if target_member.role == 'owner':
-        return jsonify({'error': 'Cannot remove owner'}), 403
+        return _error('Cannot remove owner', status_code=403)
     db.session.delete(target_member)
     db.session.commit()
-    return jsonify({'message': 'Member removed'}), 200
+    return _success({'message': 'Member removed'})

@@ -1,17 +1,20 @@
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
 import axios from 'axios';
 const API_URL = 'http://localhost:5000/api';
+
 export const fetchVMs = createAsyncThunk(
   'resources/fetchVMs',
   async (orgId, { getState, rejectWithValue }) => {
     try {
       const token = getState().auth.token;
-      const response = await axios.get(`${API_URL}/resources/vm?organization_id=${orgId}`, {
+      const query = orgId ? `?organization_id=${orgId}` : '';
+      const response = await axios.get(`${API_URL}/resources/vm${query}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return response.data.vms;
+      const payload = response?.data?.data || {};
+      return Array.isArray(payload?.vms) ? payload.vms : [];
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error);
+      return rejectWithValue(error?.response?.data?.error?.message || 'Failed to load resources');
     }
   }
 );
@@ -20,12 +23,14 @@ export const fetchDatabases = createAsyncThunk(
   async (orgId, { getState, rejectWithValue }) => {
     try {
       const token = getState().auth.token;
-      const response = await axios.get(`${API_URL}/resources/db?organization_id=${orgId}`, {
+      const query = orgId ? `?organization_id=${orgId}` : '';
+      const response = await axios.get(`${API_URL}/resources/db${query}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return response.data.databases;
+      const payload = response?.data?.data || {};
+      return Array.isArray(payload?.databases) ? payload.databases : [];
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error);
+      return rejectWithValue(error?.response?.data?.error?.message || 'Failed to load databases');
     }
   }
 );
@@ -37,9 +42,9 @@ export const createVM = createAsyncThunk(
       const response = await axios.post(`${API_URL}/resources/vm`, data, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return response.data;
+      return response?.data?.data || {};
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error);
+      return rejectWithValue(error?.response?.data?.error?.message || 'Failed to create VM');
     }
   }
 );
@@ -51,9 +56,9 @@ export const createDatabase = createAsyncThunk(
       const response = await axios.post(`${API_URL}/resources/db`, data, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return response.data;
+      return response?.data?.data || {};
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error);
+      return rejectWithValue(error?.response?.data?.error?.message || 'Failed to create database');
     }
   }
 );
@@ -67,9 +72,9 @@ export const vmAction = createAsyncThunk(
         { action },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      return response.data;
+      return response?.data?.data || {};
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error);
+      return rejectWithValue(error?.response?.data?.error?.message || 'Failed VM action');
     }
   }
 );
@@ -83,9 +88,9 @@ export const dbAction = createAsyncThunk(
         { action },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      return response.data;
+      return response?.data?.data || {};
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error);
+      return rejectWithValue(error?.response?.data?.error?.message || 'Failed DB action');
     }
   }
 );
@@ -108,9 +113,19 @@ const resourceSlice = createSlice({
         state.loading = false;
         state.vms = action.payload;
       })
+      .addCase(fetchVMs.rejected, (state, action) => {
+        state.loading = false;
+        state.error = action.payload;
+        state.vms = [];
+      })
       .addCase(fetchDatabases.fulfilled, (state, action) => {
         state.loading = false;
         state.databases = action.payload;
+      })
+      .addCase(fetchDatabases.rejected, (state, action) => {
+        state.loading = false;
+        state.error = action.payload;
+        state.databases = [];
       })
       .addCase(createVM.fulfilled, (state, action) => {
         state.vms.push(action.payload.vm);

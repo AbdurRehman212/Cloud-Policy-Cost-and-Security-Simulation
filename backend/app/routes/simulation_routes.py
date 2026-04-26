@@ -6,6 +6,7 @@ from functools import wraps
 import logging
 
 from flask import Blueprint, jsonify, request
+from app.utils.dataset_loader import dataset_info
 
 from app.services.simulation_engine import (
     DEFAULT_NOISE_MAX,
@@ -29,13 +30,11 @@ class RequestValidationError(ValueError):
     """Raised when simulation query parameters are invalid."""
 
 
-def _success(data, meta=None, status_code=200):
+def _success(data, status_code=200):
     payload = {
         'status': 'success',
         'data': data,
     }
-    if meta is not None:
-        payload['meta'] = meta
     return jsonify(payload), status_code
 
 
@@ -43,7 +42,6 @@ def _error(message, status_code=500, code='simulation_error'):
     return jsonify({
         'status': 'error',
         'error': {
-            'code': code,
             'message': message,
         },
     }), status_code
@@ -125,14 +123,7 @@ def _simulation_options():
 @_guard
 def metrics():
     options = _simulation_options()
-    return _success(
-        generate_metrics(**options),
-        meta={
-            'points': options['points'],
-            'seed': options['seed'],
-            'refresh_interval_seconds': 5,
-        },
-    )
+    return _success(generate_metrics(**options))
 
 
 @simulation_bp.route('/summary', methods=['GET'])
@@ -151,10 +142,27 @@ def peaks():
 @_guard
 def cost():
     options = _simulation_options()
-    return _success(get_cost(**options), meta={'points': options['points'], 'seed': options['seed']})
+    return _success(get_cost(**options))
 
 
 @simulation_bp.route('/health', methods=['GET'])
 @_guard
 def health():
-    return _success(get_health())
+    health_info = get_health()
+    return _success({
+        'dataset_loaded': bool(health_info.get('dataset_loaded', False)),
+        'rows': int(health_info.get('row_count', 0)),
+        'uptime': health_info.get('uptime_seconds', 0),
+        'simulation_ready': True,
+    })
+
+
+@simulation_bp.route('/simulation/source', methods=['GET'])
+@_guard
+def simulation_source():
+    info = dataset_info()
+    return _success({
+        'dataset': 'google_cluster_trace',
+        'rows': int(info.get('rows', 0)),
+        'fields': ['cpu_avg', 'mem_avg'],
+    })

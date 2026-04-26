@@ -1,7 +1,9 @@
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
-from app.models.organization import Organization, OrganizationMember
+from app import db
+from app.models.user import User
+from app.models.organization import Organization, OrganizationMember, ensure_default_organization_membership
 
 membership_bp = Blueprint('membership', __name__)
 
@@ -53,18 +55,55 @@ def infer_plan(max_resources):
     return 'starter'
 
 
+def _resolve_membership(user_id, requested_org_id=None):
+    """Resolve membership with a safe demo fallback."""
+    if requested_org_id:
+        member = OrganizationMember.query.filter_by(
+            organization_id=requested_org_id,
+            user_id=user_id,
+        ).first()
+        if member:
+            return member
+
+    member = (
+        OrganizationMember.query
+        .filter_by(user_id=user_id)
+        .order_by(OrganizationMember.joined_at.asc(), OrganizationMember.id.asc())
+        .first()
+    )
+    if member:
+        return member
+
+    user = User.query.get(user_id)
+    if not user:
+        return None
+
+    _, member, created = ensure_default_organization_membership(user)
+    if created:
+        db.session.commit()
+    return member
+
+
 @membership_bp.route('/plans', methods=['GET'])
 @jwt_required()
 def list_plans():
+    user_id = get_jwt_identity()
     org_id = request.args.get('organization_id', type=int)
-    current_plan = 'starter'
-    if org_id:
-        org = Organization.query.get(org_id)
-        if org:
-            current_plan = infer_plan(org.max_resources)
-    return jsonify({
+
+    member = _resolve_membership(user_id, org_id)
+    if member and member.organization:
+        current_plan = infer_plan(member.organization.max_resources)
+    else:
+        current_plan = 'starter'
+
+    payload = {
         'current_plan': current_plan,
         'plans': PLANS,
+    }
+    return jsonify({
+        'status': 'success',
+        'data': payload,
+        **payload,
     }), 200
 
 
@@ -73,15 +112,54 @@ def list_plans():
 def current_membership():
     user_id = get_jwt_identity()
     org_id = request.args.get('organization_id', type=int)
-    member = OrganizationMember.query.filter_by(organization_id=org_id, user_id=user_id).first()
+    member = _resolve_membership(user_id, org_id)
     if not member:
-        return jsonify({'error': 'Access denied'}), 403
-    org = Organization.query.get_or_404(org_id)
+        return jsonify({
+            'status': 'error',
+            'error': {'message': 'Membership not found.'},
+        }), 404
+
+    org = member.organization
+    if not org:
+        return jsonify({
+            'status': 'error',
+            'error': {'message': 'Organization not found for membership.'},
+        }), 404
+
     plan_id = infer_plan(org.max_resources)
     plan = next((plan for plan in PLANS if plan['id'] == plan_id), PLANS[0])
-    return jsonify({
-        'organization_id': org_id,
+
+    payload = {
+        'organization_id': org.id,
         'plan': plan,
         'resource_limit': org.max_resources,
         'member_role': member.role,
+    }
+    return jsonify({
+        'status': 'success',
+        'data': payload,
+        **payload,
+    }), 200
+
+
+@membership_bp.route('/me', methods=['GET'])
+@jwt_required()
+def membership_me():
+    """Return current user membership safely for demo flows."""
+    user_id = get_jwt_identity()
+    member = _resolve_membership(user_id)
+
+    if not member:
+        return jsonify({
+            'status': 'error',
+            'error': {'message': 'Membership not found.'},
+        }), 404
+
+    return jsonify({
+        'status': 'success',
+        'data': {
+            'user_id': member.user_id,
+            'org_id': member.organization_id,
+            'role': member.role or 'owner',
+        },
     }), 200

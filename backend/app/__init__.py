@@ -20,7 +20,6 @@ def _json_error(message, status_code=500, code='internal_error'):
     return jsonify({
         'status': 'error',
         'error': {
-            'code': code,
             'message': message,
         },
     }), status_code
@@ -57,7 +56,7 @@ def create_app(config_name='default'):
     # Register blueprints
     from app.routes.auth import auth_bp
     from app.routes.organization import org_bp
-    from app.routes.resources import resource_bp
+    from app.routes.resources import resource_bp, start_resource_updates
     from app.routes.governance import governance_bp
     from app.routes.security import security_bp
     from app.routes.cost import cost_bp
@@ -82,6 +81,8 @@ def create_app(config_name='default'):
     # Create database tables
     with app.app_context():
         db.create_all()
+        if not app.config.get('TESTING'):
+            start_resource_updates()
         if app.config.get('ENABLE_REALTIME_METRICS') and not app.config.get('TESTING'):
             from app.services.metrics_streamer import metrics_streamer
 

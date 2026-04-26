@@ -7,11 +7,12 @@ export const login = createAsyncThunk(
   async (credentials, { rejectWithValue }) => {
     try {
       const response = await axios.post(`${API_URL}/auth/login`, credentials);
-      localStorage.setItem('token', response.data.access_token);
-      localStorage.setItem('refresh_token', response.data.refresh_token);
-      return response.data;
+      const payload = response?.data?.data || {};
+      localStorage.setItem('token', payload.access_token || '');
+      localStorage.setItem('refresh_token', payload.refresh_token || '');
+      return payload;
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error || 'Login failed');
+      return rejectWithValue(error?.response?.data?.error?.message || 'Login failed');
     }
   }
 );
@@ -20,9 +21,9 @@ export const register = createAsyncThunk(
   async (userData, { rejectWithValue }) => {
     try {
       const response = await axios.post(`${API_URL}/auth/register`, userData);
-      return response.data;
+      return response?.data?.data || {};
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error || 'Registration failed');
+      return rejectWithValue(error?.response?.data?.error?.message || 'Registration failed');
     }
   }
 );
@@ -34,9 +35,9 @@ export const fetchProfile = createAsyncThunk(
       const response = await axios.get(`${API_URL}/auth/profile`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return response.data;
+      return response?.data?.data || {};
     } catch (error) {
-      return rejectWithValue(error.response?.data?.error);
+      return rejectWithValue(error?.response?.data?.error?.message || 'Failed to load profile');
     }
   }
 );
