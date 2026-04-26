@@ -154,6 +154,8 @@ def health():
         'rows': int(health_info.get('row_count', 0)),
         'uptime': health_info.get('uptime_seconds', 0),
         'simulation_ready': True,
+        'organization_id': 1,
+        'role': 'system',
     })
 
 

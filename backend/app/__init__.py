@@ -13,7 +13,7 @@ db = SQLAlchemy()
 migrate = Migrate()
 jwt = JWTManager()
 mail = Mail()
-socketio = SocketIO(cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(cors_allowed_origins="*", async_mode='eventlet', cors_credentials=True, ping_timeout=60, ping_interval=25)
 
 
 def _json_error(message, status_code=500, code='internal_error'):
@@ -69,6 +69,8 @@ def create_app(config_name='default'):
     app.register_blueprint(simulation_bp, url_prefix='/api')
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(org_bp, url_prefix='/api/org')
+    from app.routes.organization import simple_invite
+    app.add_url_rule('/api/invite', view_func=simple_invite, methods=['POST'])
     app.register_blueprint(resource_bp, url_prefix='/api/resources')
     app.register_blueprint(governance_bp, url_prefix='/api/governance')
     app.register_blueprint(security_bp, url_prefix='/api/security')

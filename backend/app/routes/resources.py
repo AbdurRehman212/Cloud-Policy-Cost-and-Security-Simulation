@@ -31,7 +31,33 @@ RESOURCE_UPDATE_INTERVAL_SECONDS = 5
 
 
 def _success(data, status_code=200):
-    return jsonify({'status': 'success', 'data': data}), status_code
+    user_id = None
+    try:
+        user_id = get_jwt_identity()
+    except Exception:
+        pass
+    
+    org_id = request.args.get('organization_id', type=int)
+    role = 'system'
+    if user_id:
+        if not org_id:
+            org_id = _resolve_org_id_for_user(user_id) or 1
+        
+        member = OrganizationMember.query.filter_by(
+            organization_id=org_id,
+            user_id=user_id
+        ).first()
+        if member:
+            role = member.role
+    else:
+        org_id = org_id or 1
+
+    return jsonify({
+        'status': 'success', 
+        'data': data,
+        'organization_id': org_id,
+        'role': role
+    }), status_code
 
 
 def _error(message, status_code=400, code='bad_request'):
@@ -123,7 +149,7 @@ def _resource_envelope(resource):
         'base_cpu': _sanitize_metric(resource.get('base_cpu', resource.get('cpu')), fallback=0.02),
         'base_memory': _sanitize_metric(resource.get('base_memory', resource.get('memory')), fallback=0.03),
         'seed': seed,
-        'org_id': resource.get('org_id'),
+        'organization_id': resource.get('org_id'),
         'created_at': resource.get('created_at') or now_iso,
         'last_updated': resource.get('last_updated') or now_iso,
     }
@@ -133,7 +159,7 @@ def _resource_envelope(resource):
         'id',
         'name',
         'type',
-        'org_id',
+        'organization_id',
         'status',
         'cpu',
         'memory',
@@ -212,17 +238,19 @@ def _update_resources_with_simulation(force=False):
 
             resource_base_cpu = _sanitize_metric(resource.get('base_cpu'), fallback=dataset_cpu)
             resource_base_memory = _sanitize_metric(resource.get('base_memory'), fallback=dataset_memory)
-            target_cpu = _sanitize_metric(
-                resource_base_cpu + cpu_offset + ((dataset_cpu - resource_base_cpu) * 0.08),
-                fallback=resource_base_cpu,
-            )
-            target_memory = _sanitize_metric(
-                resource_base_memory + mem_offset + ((dataset_memory - resource_base_memory) * 0.08),
-                fallback=resource_base_memory,
-            )
 
-            resource['cpu'] = _evolve_metric(resource.get('cpu', target_cpu), target_cpu, seed, step)
-            resource['memory'] = _evolve_metric(resource.get('memory', target_memory), target_memory, seed + 17, step)
+            variation_scale = {
+                "t2.micro": 0.5,
+                "t2.small": 0.8,
+                "t2.medium": 1.0
+            }
+            scale = variation_scale.get(resource.get('instance_type'), 0.5)
+
+            dataset_cpu_variation = (cpu_offset + ((dataset_cpu - resource_base_cpu) * 0.08)) * scale
+            dataset_memory_variation = (mem_offset + ((dataset_memory - resource_base_memory) * 0.08)) * scale
+
+            resource['cpu'] = _sanitize_metric(resource_base_cpu + dataset_cpu_variation)
+            resource['memory'] = _sanitize_metric(resource_base_memory + dataset_memory_variation)
             resource['last_updated'] = base_metric.get('time') or now_iso
 
         for resource in RESOURCES:
@@ -313,7 +341,7 @@ def list_resources():
     if current_org_id is None:
         return _success([])
     if org_id_filter is not None and org_id_filter != current_org_id:
-        return _error('Access denied for organization.', status_code=403, code='forbidden')
+        return _success([])
 
     _update_resources_with_simulation(force=False)
 
@@ -330,22 +358,41 @@ def list_resources():
     return _success(scoped_resources)
 
 
+INSTANCE_TYPES = {
+  "t2.micro":  { "vcpu": 1, "memory_gb": 1, "baseline_cpu": 0.20, "baseline_memory": 0.30 },
+  "t2.small":  { "vcpu": 1, "memory_gb": 2, "baseline_cpu": 0.40, "baseline_memory": 0.50 },
+  "t2.medium": { "vcpu": 2, "memory_gb": 4, "baseline_cpu": 0.60, "baseline_memory": 0.70 }
+}
+
 def _create_in_memory_resource(user_id, data, resource_type):
     org_id = _resolve_org_id_for_user(
         user_id,
         data.get('org_id', data.get('organization_id')),
     )
     if org_id is None:
-        return None, _error('No organization available for this user.', status_code=404, code='organization_missing')
+        org_id = 1
+
+    if not check_org_access(user_id, org_id, 'member'):
+        return None, _error('Permission denied', status_code=403)
 
     name_prefix = 'DB' if resource_type == 'database' else 'VM'
     now_iso = datetime.utcnow().isoformat()
     dataset_points = generate_metrics(points=1)
     dataset_base = dataset_points[0] if dataset_points else {}
-    base_cpu = _sanitize_metric(dataset_base.get('cpu'), fallback=0.05)
-    base_memory = _sanitize_metric(dataset_base.get('memory'), fallback=0.07)
+    
+    instance_type = data.get('instance_type')
+    if instance_type in INSTANCE_TYPES:
+        base_cpu = INSTANCE_TYPES[instance_type]['baseline_cpu']
+        base_memory = INSTANCE_TYPES[instance_type]['baseline_memory']
+    else:
+        base_cpu = _sanitize_metric(dataset_base.get('cpu'), fallback=0.05)
+        base_memory = _sanitize_metric(dataset_base.get('memory'), fallback=0.07)
 
     with _RESOURCE_LOCK:
+        org_resources = [r for r in RESOURCES if r.get('org_id') == org_id]
+        if len(org_resources) >= 5:
+            return None, _error('Quota exceeded', status_code=400)
+
         resource_id = _next_resource_id()
         name = (data.get('name') or f'{name_prefix}-{resource_id}').strip() or f'{name_prefix}-{resource_id}'
 
@@ -353,6 +400,7 @@ def _create_in_memory_resource(user_id, data, resource_type):
             'id': resource_id,
             'name': name,
             'type': resource_type,
+            'instance_type': instance_type,
             'engine': data.get('engine', 'PostgreSQL') if resource_type == 'database' else None,
             'cpu': base_cpu,
             'memory': base_memory,
@@ -402,14 +450,12 @@ def create_resource():
 def delete_resource(resource_id):
     """Delete a simulated resource safely from memory."""
     user_id = get_jwt_identity()
-    allowed_org_ids = _ensure_org_membership(user_id)
-
     with _RESOURCE_LOCK:
         for index, resource in enumerate(RESOURCES):
             if resource.get('id') != resource_id:
                 continue
-            if resource.get('org_id') not in allowed_org_ids:
-                return _error('Access denied for resource.', status_code=403, code='forbidden')
+            if not check_org_access(user_id, resource.get('org_id'), 'admin'):
+                return _error('Permission denied', status_code=403)
 
             removed = RESOURCES.pop(index)
             payload = _resource_envelope(dict(removed))
@@ -425,14 +471,12 @@ def delete_resource(resource_id):
 def stop_resource(resource_id):
     """Stop a simulated resource and reduce utilization."""
     user_id = get_jwt_identity()
-    allowed_org_ids = _ensure_org_membership(user_id)
-
     with _RESOURCE_LOCK:
         for resource in RESOURCES:
             if resource.get('id') != resource_id:
                 continue
-            if resource.get('org_id') not in allowed_org_ids:
-                return _error('Access denied for resource.', status_code=403, code='forbidden')
+            if not check_org_access(user_id, resource.get('org_id'), 'member'):
+                return _error('Permission denied', status_code=403)
 
             resource['status'] = 'stopped'
             resource['cpu'] = _sanitize_metric(float(resource.get('cpu', 0.05)) * 0.2, fallback=0.02)
@@ -446,28 +490,82 @@ def stop_resource(resource_id):
     return _error('Resource not found.', status_code=404, code='not_found')
 
 
+@resource_bp.route('/<int:resource_id>/start', methods=['POST'])
+@jwt_required()
+def start_resource(resource_id):
+    """Start a stopped simulated resource."""
+    user_id = get_jwt_identity()
+    with _RESOURCE_LOCK:
+        for resource in RESOURCES:
+            if resource.get('id') != resource_id:
+                continue
+            if not check_org_access(user_id, resource.get('org_id'), 'member'):
+                return _error('Permission denied', status_code=403)
+
+            if resource.get('status') == 'stopped':
+                resource['status'] = 'running'
+                resource['last_updated'] = datetime.utcnow().isoformat()
+            
+            payload = _resource_envelope(dict(resource))
+            if payload is None:
+                return _error('Resource state is invalid.', status_code=500, code='resource_invalid')
+            return _success(payload)
+
+    return _error('Resource not found.', status_code=404, code='not_found')
+
+
+@resource_bp.route('/<int:resource_id>/restart', methods=['POST'])
+@jwt_required()
+def restart_resource(resource_id):
+    """Restart a running simulated resource."""
+    user_id = get_jwt_identity()
+    with _RESOURCE_LOCK:
+        for resource in RESOURCES:
+            if resource.get('id') != resource_id:
+                continue
+            if not check_org_access(user_id, resource.get('org_id'), 'member'):
+                return _error('Permission denied', status_code=403)
+
+            if resource.get('status') in ['running', 'stopped']:
+                if resource.get('status') == 'stopped':
+                    resource['status'] = 'running'
+                else:
+                    resource['status'] = 'creating'
+                    resource['cpu'] = _sanitize_metric(float(resource.get('cpu', 0.05)) * 0.1, fallback=0.01)
+                    resource['memory'] = _sanitize_metric(float(resource.get('memory', 0.05)) * 0.1, fallback=0.01)
+                    socketio.start_background_task(_complete_resource_creation, resource_id)
+                resource['last_updated'] = datetime.utcnow().isoformat()
+            
+            payload = _resource_envelope(dict(resource))
+            if payload is None:
+                return _error('Resource state is invalid.', status_code=500, code='resource_invalid')
+            return _success(payload)
+
+    return _error('Resource not found.', status_code=404, code='not_found')
+
 @resource_bp.route('/vm', methods=['POST'])
 @jwt_required()
 def create_vm():
     """Create virtual machine."""
     user_id = get_jwt_identity()
     data = request.get_json() or {}
-    org_id = data.get('organization_id')
+    org_id = _resolve_org_id_for_user(user_id, data.get('organization_id', data.get('org_id')))
+    if org_id is None:
+        org_id = 1
     if not check_org_access(user_id, org_id, 'member'):
-        return _error('Access denied', status_code=403, code='forbidden')
+        return _error('Permission denied', status_code=403)
     payload, error_response = _create_in_memory_resource(user_id, data, 'vm')
     if error_response is not None:
         return error_response
-    return _success({
-        'message': 'VM creation initiated',
-        'vm': payload
-    }, status_code=201)
+    return _success(payload, status_code=201)
 @resource_bp.route('/vm', methods=['GET'])
 @jwt_required()
 def list_vms():
     """List virtual machines."""
     user_id = get_jwt_identity()
     org_id = request.args.get('organization_id', type=int)
+    if org_id is None:
+        org_id = _resolve_org_id_for_user(user_id) or 1
     if not check_org_access(user_id, org_id, 'viewer'):
         return _error('Access denied', status_code=403, code='forbidden')
     _update_resources_with_simulation(force=False)
@@ -475,9 +573,9 @@ def list_vms():
         vms = [
             payload
             for payload in (_resource_envelope(dict(resource)) for resource in RESOURCES)
-            if payload is not None and payload.get('org_id') == org_id and payload.get('type') == 'vm'
+            if payload is not None and payload.get('organization_id') == org_id and payload.get('type') == 'vm'
         ]
-    return _success({'vms': vms})
+    return _success(vms)
 @resource_bp.route('/vm/<instance_id>', methods=['GET'])
 @jwt_required()
 def get_vm(instance_id):
@@ -526,8 +624,9 @@ def vm_action(instance_id):
                 break
         if not target:
             return _error('VM not found', status_code=404, code='not_found')
-        if target.get('org_id') not in allowed_org_ids:
-            return _error('Access denied', status_code=403, code='forbidden')
+        required_role = 'admin' if action == 'terminate' else 'member'
+        if not check_org_access(user_id, target.get('org_id'), required_role):
+            return _error('Permission denied', status_code=403)
 
         if action == 'stop':
             target['status'] = 'stopped'
@@ -546,10 +645,7 @@ def vm_action(instance_id):
         if payload is None:
             return _error('VM state is invalid.', status_code=500, code='resource_invalid')
 
-    return _success({
-        'message': f'VM {action} successful',
-        'vm': payload
-    })
+    return _success(payload)
 @resource_bp.route('/db/<instance_id>/action', methods=['POST'])
 @jwt_required()
 def database_action(instance_id):
@@ -573,8 +669,9 @@ def database_action(instance_id):
                 break
         if not target:
             return _error('Database not found', status_code=404, code='not_found')
-        if target.get('org_id') not in allowed_org_ids:
-            return _error('Access denied', status_code=403, code='forbidden')
+        required_role = 'admin' if action == 'terminate' else 'member'
+        if not check_org_access(user_id, target.get('org_id'), required_role):
+            return _error('Permission denied', status_code=403)
 
         if action == 'stop':
             target['status'] = 'stopped'
@@ -593,32 +690,30 @@ def database_action(instance_id):
         if payload is None:
             return _error('Database state is invalid.', status_code=500, code='resource_invalid')
 
-    return _success({
-        'message': f'Database {action} successful',
-        'database': payload
-    })
+    return _success(payload)
 @resource_bp.route('/db', methods=['POST'])
 @jwt_required()
 def create_database():
     """Create database instance."""
     user_id = get_jwt_identity()
     data = request.get_json() or {}
-    org_id = data.get('organization_id')
+    org_id = _resolve_org_id_for_user(user_id, data.get('organization_id', data.get('org_id')))
+    if org_id is None:
+        org_id = 1
     if not check_org_access(user_id, org_id, 'member'):
-        return _error('Access denied', status_code=403, code='forbidden')
+        return _error('Permission denied', status_code=403)
     payload, error_response = _create_in_memory_resource(user_id, data, 'database')
     if error_response is not None:
         return error_response
-    return _success({
-        'message': 'Database creation initiated',
-        'database': payload
-    }, status_code=201)
+    return _success(payload, status_code=201)
 @resource_bp.route('/db', methods=['GET'])
 @jwt_required()
 def list_databases():
     """List databases."""
     user_id = get_jwt_identity()
     org_id = request.args.get('organization_id', type=int)
+    if org_id is None:
+        org_id = _resolve_org_id_for_user(user_id) or 1
     if not check_org_access(user_id, org_id, 'viewer'):
         return _error('Access denied', status_code=403, code='forbidden')
     _update_resources_with_simulation(force=False)
@@ -626,15 +721,17 @@ def list_databases():
         databases = [
             payload
             for payload in (_resource_envelope(dict(resource)) for resource in RESOURCES)
-            if payload is not None and payload.get('org_id') == org_id and payload.get('type') == 'database'
+            if payload is not None and payload.get('organization_id') == org_id and payload.get('type') == 'database'
         ]
-    return _success({'databases': databases})
+    return _success(databases)
 @resource_bp.route('/metrics', methods=['GET'])
 @jwt_required()
 def get_resource_metrics():
     """Get aggregated resource metrics."""
     user_id = get_jwt_identity()
     org_id = request.args.get('organization_id', type=int)
+    if org_id is None:
+        org_id = _resolve_org_id_for_user(user_id) or 1
     if not check_org_access(user_id, org_id, 'viewer'):
         return _error('Access denied', status_code=403, code='forbidden')
     _update_resources_with_simulation(force=False)
@@ -642,7 +739,7 @@ def get_resource_metrics():
         scoped_resources = [
             payload
             for payload in (_resource_envelope(dict(resource)) for resource in RESOURCES)
-            if payload is not None and payload.get('org_id') == org_id
+            if payload is not None and payload.get('organization_id') == org_id
         ]
 
     vms = [resource for resource in scoped_resources if resource.get('type') == 'vm']

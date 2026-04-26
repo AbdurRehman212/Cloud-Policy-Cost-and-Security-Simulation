@@ -159,7 +159,7 @@ def membership_me():
         'status': 'success',
         'data': {
             'user_id': member.user_id,
-            'org_id': member.organization_id,
+            'organization_id': member.organization_id,
             'role': member.role or 'owner',
         },
     }), 200

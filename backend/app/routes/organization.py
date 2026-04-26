@@ -60,9 +60,16 @@ def list_organizations():
     for membership in memberships:
         org = membership.organization
         org_data = org.to_dict()
+        org_data['organization_id'] = org.id
+        org_data['role'] = membership.role
         org_data['my_role'] = membership.role
         orgs.append(org_data)
-    return _success({'organizations': orgs})
+        
+    return _success({
+        'organizations': orgs,
+        'organization_id': orgs[0]['organization_id'] if orgs else 1,
+        'role': orgs[0]['role'] if orgs else 'system'
+    })
 @org_bp.route('/<int:org_id>', methods=['GET'])
 @jwt_required()
 def get_organization(org_id):
@@ -79,6 +86,8 @@ def get_organization(org_id):
     if not member:
         return _error('Access denied', status_code=403)
     data = org.to_dict()
+    data['organization_id'] = org.id
+    data['role'] = member.role
     data['my_role'] = member.role
     # Get members
     members = []
@@ -202,3 +211,54 @@ def remove_member(org_id, member_id):
     db.session.delete(target_member)
     db.session.commit()
     return _success({'message': 'Member removed'})
+
+@org_bp.route('/invite_demo', methods=['POST'])
+@jwt_required()
+def simple_invite():
+    """Demo-safe invite that creates users and assigns roles without email."""
+    user_id = get_jwt_identity()
+    data = request.get_json() or {}
+    email = data.get('email', '').lower().strip()
+    role = data.get('role', 'member')
+
+    if not email:
+        return _error('Email required', status_code=400)
+    if role not in ['admin', 'member', 'viewer', 'owner']:
+        return _error('Invalid role', status_code=400)
+
+    memberships = OrganizationMember.query.filter_by(user_id=user_id).all()
+    if not memberships:
+        return _error('You must belong to an organization', status_code=400)
+    
+    org_id = data.get('organization_id') or memberships[0].organization_id
+
+    current_member = OrganizationMember.query.filter_by(organization_id=org_id, user_id=user_id).first()
+    if not current_member or current_member.role not in ['owner', 'admin']:
+        return _error('Permission denied', status_code=403)
+
+    target_user = User.query.filter_by(email=email).first()
+    if not target_user:
+        target_user = User(
+            email=email,
+            first_name=email.split('@')[0],
+            last_name='User',
+            is_active=True,
+            email_verified=True
+        )
+        target_user.set_password('Demo1234')
+        db.session.add(target_user)
+        db.session.flush()
+
+    existing_member = OrganizationMember.query.filter_by(organization_id=org_id, user_id=target_user.id).first()
+    if existing_member:
+        existing_member.role = role
+    else:
+        new_member = OrganizationMember(
+            organization_id=org_id,
+            user_id=target_user.id,
+            role=role
+        )
+        db.session.add(new_member)
+
+    db.session.commit()
+    return _success({'message': f'User {email} added as {role}'}, status_code=200)
