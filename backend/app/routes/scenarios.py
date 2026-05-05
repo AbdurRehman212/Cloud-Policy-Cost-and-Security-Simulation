@@ -8,6 +8,16 @@ from app.data.scenarios import SCENARIOS
 from app.models.organization import OrganizationMember, ensure_default_organization_membership
 from app.models.scenarios import ScenarioProgress
 from app.models.user import User
+from app.services import control_plane
+from app.models.settings import UserSettings
+from app.services.learning_engine import (
+    curriculum_limit,
+    evaluate_scenario_decision,
+    learning_loop_for_scenario,
+    next_unlocked_scenario,
+    normalize_learning_level,
+    scenario_unlock_state,
+)
 
 scenarios_bp = Blueprint('scenarios', __name__)
 
@@ -53,10 +63,14 @@ def _check_org_access(user_id, org_id, min_role='viewer'):
 
 def _scenario_payload(scenario, progress=None):
     total_steps = len(scenario.get('steps', []))
+    learning_story = learning_loop_for_scenario(scenario)
     payload = {
         **scenario,
         'total_steps': total_steps,
         'progress': progress.to_dict() if progress else None,
+        'completion_ratio': round(((progress.current_step or 0) / total_steps) * 100, 1) if progress and total_steps else 0,
+        'learning_story': learning_story,
+        'role_focus': scenario.get('recommended_for', 'student'),
     }
     return payload
 
@@ -68,6 +82,51 @@ def _get_progress(user_id, org_id, scenario_id):
         scenario_id=scenario_id,
     ).first()
 
+def _selected_learning_track(user_id, progress=None, preferred=None):
+    settings = UserSettings.query.filter_by(user_id=user_id).first()
+    layout = settings.dashboard_layout if settings and isinstance(settings.dashboard_layout, dict) else {}
+    stored = layout.get('learning_level') if isinstance(layout, dict) else None
+    return normalize_learning_level(preferred or stored or getattr(progress, 'learning_stage', None))
+
+
+def _scenario_is_locked(user_id, progress, scenario_id, track):
+    next_scenario = next_unlocked_scenario(progress=progress, level=track)
+    next_scenario_id = next_scenario.get('id') if next_scenario else None
+    lock_limit = curriculum_limit(track)
+    member = None
+    try:
+        member = OrganizationMember.query.filter_by(user_id=user_id).first()
+    except Exception:
+        member = None
+    if member and member.role in {'admin', 'owner'}:
+        return False, None
+    completed = set(str(item) for item in (getattr(progress, 'scenarios_completed', None) or []))
+    if int(scenario_id) in completed:
+        return False, None
+    if int(scenario_id) > lock_limit:
+        return True, 'Complete the current learning path first.'
+    if next_scenario_id is None:
+        return True, 'Complete the current learning path first.'
+    if int(scenario_id) != int(next_scenario_id):
+        return True, f'Unlock the next recommended scenario first: {next_scenario.get("title", "the next module")}'
+    return False, None
+
+
+def _scenario_access_payload(user_id, org_id, scenario, progress=None, preferred_track=None):
+    track = _selected_learning_track(user_id, progress=progress, preferred=preferred_track)
+    locked, reason = _scenario_is_locked(user_id, progress, scenario['id'], track)
+    payload = _scenario_payload(scenario, progress)
+    payload.update({
+        'learning_track': track,
+        'learning_limit': curriculum_limit(track),
+        'learning_lock': {
+            'locked': locked,
+            'reason': reason,
+            'next_scenario': next_unlocked_scenario(progress=progress, level=track),
+        },
+        'unlock_state': scenario_unlock_state(progress=progress, level=track),
+    })
+    return payload, locked, reason
 
 @scenarios_bp.route('', methods=['GET'])
 @jwt_required()
@@ -84,7 +143,17 @@ def list_scenarios():
         progress.scenario_id: progress
         for progress in ScenarioProgress.query.filter_by(user_id=user_id, org_id=org_id).all()
     }
-    scenarios = [_scenario_payload(scenario, progress_rows.get(scenario['id'])) for scenario in SCENARIOS]
+    preferred_track = request.args.get('level')
+    scenarios = []
+    for scenario in SCENARIOS:
+        scenario_payload, _, _ = _scenario_access_payload(
+            user_id,
+            org_id,
+            scenario,
+            progress_rows.get(scenario['id']),
+            preferred_track=preferred_track,
+        )
+        scenarios.append(scenario_payload)
     return jsonify({'status': 'success', 'data': scenarios, 'organization_id': org_id}), 200
 
 
@@ -104,9 +173,12 @@ def get_scenario_detail(scenario_id):
         return _error('Access denied', status_code=403, code='forbidden')
 
     progress = _get_progress(user_id, org_id, scenario_id)
+    payload, locked, reason = _scenario_access_payload(user_id, org_id, scenario, progress)
+    if locked:
+        return _error(reason or 'Scenario locked', status_code=403, code='locked_scenario')
     return jsonify({
         'status': 'success',
-        'data': _scenario_payload(scenario, progress),
+        'data': payload,
         'organization_id': org_id,
     }), 200
 
@@ -215,6 +287,11 @@ def validate_step(scenario_id):
     if not _check_org_access(user_id, org_id, 'viewer'):
         return _error('Access denied', status_code=403, code='forbidden')
 
+    progress = _get_progress(user_id, org_id, scenario_id)
+    _, locked, reason = _scenario_access_payload(user_id, org_id, scenario, progress)
+    if locked:
+        return _error(reason or 'Scenario locked', status_code=403, code='locked_scenario')
+
     step_id = data.get('step_id')
     if step_id is None:
         return _error('step_id is required', status_code=400)
@@ -227,6 +304,7 @@ def validate_step(scenario_id):
     validation_value = step.get('validation_value')
     valid = False
     message = ''
+    snapshot = control_plane.get_org_snapshot(org_id, use_cache=True)
 
     from app.models.resources import VirtualMachine, ResourceStatus
     from app.models.security import SecurityGroup, ThreatDetection
@@ -294,15 +372,67 @@ def validate_step(scenario_id):
         valid = True
         message = 'Security group modified'
 
+    elif validation_type == 'dashboard_metric_threshold':
+        field = (validation_value or {}).get('field')
+        operator = (validation_value or {}).get('operator')
+        expected = (validation_value or {}).get('value')
+        actual = snapshot.get(field)
+        if field == 'current_month_spend':
+            actual = snapshot.get('current_month_spend', snapshot.get('monthly_spend', 0))
+        elif field == 'monthly_spend':
+            actual = snapshot.get('monthly_spend', snapshot.get('current_month_spend', 0))
+        elif field == 'health_score':
+            actual = snapshot.get('health_score_calculated', snapshot.get('health_score', 0))
+        elif field == 'security_score':
+            actual = snapshot.get('security_score', 0)
+        elif field == 'bpi':
+            actual = snapshot.get('bpi', 0)
+        elif field == 'capacity':
+            actual = snapshot.get('capacity', 0)
+        elif field == 'desired_capacity':
+            actual = snapshot.get('desired_capacity', 0)
+
+        comparisons = {
+            'greater_than': lambda a, b: a > b,
+            'greater_than_or_equal': lambda a, b: a >= b,
+            'less_than': lambda a, b: a < b,
+            'less_than_or_equal': lambda a, b: a <= b,
+            'equal': lambda a, b: a == b,
+        }
+        comparator = comparisons.get(operator)
+        valid = comparator(float(actual or 0), float(expected or 0)) if comparator else False
+        message = f'{field} {operator} {expected}' if valid else f'{field} did not satisfy {operator} {expected}'
+
+    elif validation_type == 'dashboard_action_contains':
+        action = (validation_value or {}).get('action')
+        actions = snapshot.get('actions', [])
+        valid = any(action and action.lower() in str(item).lower() for item in actions)
+        message = f'Action "{action}" found' if valid else f'Action "{action}" not found'
+
+    elif validation_type == 'recovery_action_executed':
+        action = (validation_value or {}).get('action')
+        actions = snapshot.get('actions', [])
+        valid = any(action and action.lower() in str(item).lower() for item in actions)
+        message = f'Recovery action "{action}" executed' if valid else f'Recovery action "{action}" not executed'
+
+    elif validation_type == 'security_rule_updated':
+        valid = True
+        message = 'Security rule updated'
+
     else:
         valid = False
         message = f'Unknown validation type: {validation_type}'
 
+    evaluation = evaluate_scenario_decision(scenario, snapshot)
     return jsonify({
         'status': 'success',
         'data': {
             'valid': valid,
             'message': message,
+            'learning_loop': scenario.get('learning_loop', {}),
+            'cause_effect': scenario.get('cause_effect', {}),
+            'snapshot': snapshot,
+            'evaluation': evaluation,
         },
     }), 200
 
@@ -323,9 +453,13 @@ def complete_scenario(scenario_id):
     if not _check_org_access(user_id, org_id, 'member'):
         return _error('Access denied', status_code=403, code='forbidden')
 
+    progress = _get_progress(user_id, org_id, scenario_id)
+    _, locked, reason = _scenario_access_payload(user_id, org_id, scenario, progress)
+    if locked:
+        return _error(reason or 'Scenario locked', status_code=403, code='locked_scenario')
+
     points = data.get('points', scenario.get('points', 0))
 
-    progress = _get_progress(user_id, org_id, scenario_id)
     if not progress:
         progress = ScenarioProgress(
             user_id=user_id,
@@ -344,11 +478,15 @@ def complete_scenario(scenario_id):
         progress.points_earned = points
         progress.current_step = len(scenario.get('steps', []))
 
+    snapshot = control_plane.get_org_snapshot(org_id, use_cache=True)
+    evaluation = evaluate_scenario_decision(scenario, snapshot)
+
     db.session.commit()
     return jsonify({
         'status': 'success',
         'data': {
             'progress': progress.to_dict(),
             'points_earned': points,
+            'evaluation': evaluation,
         },
     }), 200
