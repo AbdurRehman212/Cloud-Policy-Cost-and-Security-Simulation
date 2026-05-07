@@ -3,10 +3,9 @@ from flask_jwt_extended import create_access_token, create_refresh_token, jwt_re
 from app import db, mail
 from app.models.user import User, UserProfile, EmailVerification
 from app.models.settings import UserSettings
-from app.models.organization import ensure_default_organization_membership, OrganizationMember
+from app.models.organization import ensure_default_organization_membership
 from flask_mail import Message
 import re
-from datetime import datetime
 auth_bp = Blueprint('auth', __name__)
 
 DEMO_EMAIL_VERIFICATION_BYPASS = True
@@ -139,35 +138,21 @@ def login():
         return _error('Invalid credentials', status_code=401)
 
     if DEMO_EMAIL_VERIFICATION_BYPASS and (not user.is_active or not user.email_verified):
-        user.is_active = True
-        user.email_verified = True
+        pass
     elif not user.is_active:
         return _error('Account not activated. Please verify your email.', status_code=403)
 
-    ensure_default_organization_membership(user)
-
-    # Update last login
-    user.last_login = datetime.utcnow()
-    db.session.commit()
     # Create tokens
     access_token = create_access_token(identity=user.id)
     refresh_token = create_refresh_token(identity=user.id)
-
-    memberships = OrganizationMember.query.filter_by(user_id=user.id).all()
-    orgs = []
-    for m in memberships:
-        if not m.organization:
-            continue
-        org_data = m.organization.to_dict()
-        org_data['role'] = m.role
-        org_data['my_role'] = m.role
-        orgs.append(org_data)
+    
+    active_org_id = user.organizations[0].organization_id if user.organizations else None
+    
     payload = {
         'access_token': access_token,
         'refresh_token': refresh_token,
         'user': user.to_dict(),
-        'organizations': orgs,
-        'active_org_id': orgs[0]['id'] if orgs else None,
+        'active_org_id': active_org_id,
     }
     return _success(payload)
 @auth_bp.route('/refresh', methods=['POST'])

@@ -15,26 +15,30 @@ jwt = JWTManager()
 mail = Mail()
 socketio = SocketIO(cors_allowed_origins="*", async_mode='eventlet', cors_credentials=True, ping_timeout=60, ping_interval=25)
 
+# Import simulation_engine after socketio to avoid circular imports
+from app.services.simulation_engine import SimulationEngine
+from flask_socketio import join_room, leave_room, rooms
+
+simulation_engine = SimulationEngine()
+
 
 @socketio.on('join_room', namespace='/metrics')
 def handle_join_room(data):
-    """Allow clients to join an org-scoped room on the /metrics namespace."""
+    """Allow clients to join an org-scoped room on the /metrics namespace and leave previous ones."""
     if isinstance(data, dict):
         org_id = data.get('org_id')
-        room = data.get('room')
-        if org_id:
-            join_room(f'org_{org_id}')
-        elif room:
+        try:
+            org_id = int(org_id)
+        except (TypeError, ValueError):
+            org_id = None
+
+        if org_id is not None:
+            room = f'org_{org_id}'
+            # Leave previous org rooms to prevent duplicate events and cross-org leakage
+            for r in rooms():
+                if r.startswith('org_') and r != room:
+                    leave_room(r)
             join_room(room)
-
-
-@socketio.on("join_room", namespace="/metrics")
-def handle_join(data):
-    """Handle room join with room parameter."""
-    from flask_socketio import join_room
-    room = data.get("room") if isinstance(data, dict) else None
-    if room:
-        join_room(room)
 
 
 def _json_error(message, status_code=500, code='internal_error'):
@@ -79,7 +83,7 @@ def create_app(config_name='default'):
     # Register blueprints
     from app.routes.auth import auth_bp
     from app.routes.organization import org_bp
-    from app.routes.resources import resource_bp, start_resource_updates
+    from app.routes.resources import resource_bp
     from app.routes.governance import governance_bp
     from app.routes.security import security_bp
     from app.routes.cost import cost_bp
@@ -111,61 +115,74 @@ def create_app(config_name='default'):
     app.register_blueprint(scenarios_bp, url_prefix='/api/scenarios')
     app.register_blueprint(membership_bp, url_prefix='/api/membership')
     app.register_blueprint(progress_bp, url_prefix='/api/progress')
+
     # Create database tables
     with app.app_context():
         db.create_all()
 
         if not app.config.get('TESTING'):
-            # Reload existing DB resources into the simulator so metrics resume after restart
-            def _reload_simulator_resources():
+            # ── Startup sync: DB → VMRegistry ────────────────────────────────
+            # VMRegistry is the ONLY runtime state.  Seed it from all running
+            # VMs in the DB so the lifecycle state machine is active immediately.
+            def _seed_vm_registry():
                 from app.models.resources import VirtualMachine, Database, ResourceStatus
+                from app.services.simulation_core import vm_registry, orm_vm_to_simvm
+                from app import simulation_engine
+
                 vms = VirtualMachine.query.filter(
                     VirtualMachine.status == ResourceStatus.RUNNING
                 ).all()
                 dbs = Database.query.filter(
                     Database.status == ResourceStatus.RUNNING
                 ).all()
-                total = len(vms) + len(dbs)
-                if total:
-                    app.logger.info(
-                        f'Simulator reload: found {len(vms)} running VMs and {len(dbs)} running DBs'
-                    )
-                else:
-                    app.logger.info('Simulator reload: no running resources found in DB')
 
-            _reload_simulator_resources()
-            start_resource_updates()
+                seeded = 0
+                for vm in vms:
+                    try:
+                        if vm_registry.get(vm.instance_id) is None:
+                            sim_vm = orm_vm_to_simvm(vm)
+                            vm_registry.register(sim_vm)
+                            # Also place on the engine's default host for quota tracking
+                            simulation_engine._default_host.vms.append(sim_vm)
+                            seeded += 1
+                    except Exception as exc:
+                        app.logger.warning(
+                            f'VMRegistry seed failed for vm {vm.instance_id}: {exc}'
+                        )
 
-            def stream_metrics(app, socketio):
-                with app.app_context():
-                    from app.models.organization import Organization
-                    while True:
-                        try:
-                            orgs = Organization.query.all()
-                            for org in orgs:
-                                snapshot = app.simulator.get_dashboard_snapshot(org.id)
-                                socketio.emit(
-                                    'metrics:snapshot',
-                                    snapshot,
-                                    room=f'org_{org.id}',
-                                    namespace='/metrics',
-                                )
-                        except Exception:
-                            app.logger.exception('stream_metrics error')
-                        socketio.sleep(5)
+                app.logger.info(
+                    f'Startup: seeded VMRegistry with {seeded}/{len(vms)} running VMs, '
+                    f'{len(dbs)} running DBs found'
+                )
 
-            socketio.start_background_task(target=stream_metrics, app=app, socketio=socketio)
+            try:
+                _seed_vm_registry()
+            except Exception as e:
+                app.logger.error(f"Failed to seed VM registry: {e}")
 
-            # TASK 1 + TASK 4: Start the control-plane cache-refresh loop as a
-            # daemon background task.  All API endpoints read from this cache
-            # so Flask request handlers never block on heavy simulation math.
+            # ── Control-plane snapshot cache (2-second refresh) ───────────────
+            # Provides fast dashboard reads without blocking HTTP request threads
+            # on heavy simulation computation.
             from app.services.control_plane import start_control_plane_loop
             start_control_plane_loop()
 
+            # ── SimulationEngine — CloudSim-style, context-per-org ────────────────
+            # The engine owns all simulation state. start() launches an idle
+            # sync thread. Per-org loops are started via start_scenario().
+            from app import simulation_engine
+            app.simulation_engine = simulation_engine
+            simulation_engine.start(app)
+            app.logger.info('SimulationEngine started (idle sync active)')
+
         if app.config.get('ENABLE_REALTIME_METRICS') and not app.config.get('TESTING'):
             from app.services.metrics_streamer import metrics_streamer
-
             metrics_streamer.start()
+
+        # Legacy ResourceSimulator — handles DES/ML telemetry, security analysis,
+        # and per-VM RPS history.  Autoscaling decisions have been migrated to
+        # SimulationEngine; ResourceSimulator's check_autoscaling is kept only
+        # for telemetry history continuity.
         if app.config.get('ENABLE_SIMULATION_THREADS') and not app.config.get('TESTING'):
             app.simulator.start(app)
+
     return app

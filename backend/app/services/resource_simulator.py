@@ -57,6 +57,8 @@ class ResourceSimulator:
     # Hard cap: max VMs processed per tick. Prevents the sim thread from
     # monopolizing the GIL when the DB has thousands of autoscaled rows.
     MAX_SIM_VMS: int = 20
+    # Hard global cap on autoscaled VMs (matches simulation_core.MAX_VMS)
+    MAX_VMS: int = 20
     # Security analysis (ML model call) is expensive — run every N ticks only.
     _SECURITY_ANALYSIS_EVERY_N_TICKS: int = 12
 
@@ -294,6 +296,7 @@ class ResourceSimulator:
         for database in dbs:
             metrics = generator.generate_database_metrics(database, moment)
             database.cpu_utilization = metrics['cpu_utilization']
+            database.memory_utilization = metrics.get('memory_utilization', 0.0)
             database.database_connections = metrics['database_connections']
             database.read_iops = metrics['read_iops']
             database.write_iops = metrics['write_iops']
@@ -381,10 +384,11 @@ class ResourceSimulator:
             )
 
         self._tick_count += 1
-        if self._tick_count % 6 == 0 and (time.monotonic() - tick_started) < 0.08:
-            org_ids = {vm.organization_id for vm in vms}
-            for org_id in org_ids:
-                self.check_autoscaling(org_id, self._app)
+        # NOTE: Autoscaling decisions are now exclusively owned by
+        # SimulationEngine.tick().  ResourceSimulator no longer calls
+        # check_autoscaling() to prevent duplicated, scattered scaling logic.
+        # check_autoscaling() is kept in this class only for telemetry continuity
+        # but is NOT called here.  Do not add it back.
 
         # Store per-org aggregated metric history point
         org_ids = {vm.organization_id for vm in vms} | {database.organization_id for database in dbs}
@@ -412,7 +416,11 @@ class ResourceSimulator:
             )
 
     def check_autoscaling(self, org_id, app):
-        """Autoscale overloaded VMs and flag underutilized ones."""
+        """Autoscale overloaded VMs and flag underutilized ones.
+
+        Scaling decision = f(queue_depth, latency, CPU).
+        Global quota: total non-terminated VMs across the org must not exceed MAX_VMS.
+        """
         if app is None:
             return
 
@@ -431,6 +439,30 @@ class ResourceSimulator:
                 now = datetime.utcnow()
                 last_scaled = self.last_scaled_at.get(vm.instance_id)
 
+                # ── Derive queue depth from current RPS and total capacity ─────
+                incoming_rps = int(vm.requests_per_second or 50)
+                # Capacity table (RPS max per instance type)
+                _CAP = {
+                    't2.micro': 50, 't2.small': 100, 't2.medium': 200,
+                    't2.large': 400, 't2.xlarge': 800,
+                    't3.micro': 60, 't3.small': 120, 't3.medium': 250,
+                    'm5.large': 300, 'm5.xlarge': 600, 'm5.2xlarge': 1200,
+                    'c5.large': 400, 'c5.xlarge': 800, 'c5.2xlarge': 1600,
+                }
+                total_capacity = sum(
+                    _CAP.get(v.instance_type or 't2.micro', 200)
+                    for v in vms
+                )
+                queue_depth = max(0, incoming_rps - total_capacity)
+                avg_cpu = float(np.mean([p.get('cpu', 0.0) for p in recent_24])) if recent_24 else 0.0
+
+                # ── Debug: queue calculation ──────────────────────────────
+                print(
+                    f"[AUTOSCALER:QUEUE] org={org_id} vm={vm.instance_id} "
+                    f"incoming_rps={incoming_rps} total_capacity={total_capacity} "
+                    f"queue_depth={queue_depth} avg_cpu_24tick={avg_cpu:.1f}%"
+                )
+
                 if (
                     len(recent_24) >= 24
                     and float(np.mean([point.get('cpu', 0.0) for point in recent_24])) > 70.0
@@ -439,6 +471,18 @@ class ResourceSimulator:
                         or (now - last_scaled).total_seconds() >= 600
                     )
                 ):
+                    # ── Enforce global VM quota before spawning ──────────────
+                    total_active = VirtualMachine.query.filter(
+                        VirtualMachine.organization_id == org_id,
+                        VirtualMachine.status != ResourceStatus.TERMINATED,
+                    ).count()
+                    if total_active >= self.MAX_VMS:
+                        print(
+                            f"[AUTOSCALER:SCALE_OUT] BLOCKED org={org_id} vm={vm.instance_id} "
+                            f"reason=global_quota_reached total_vms={total_active}/{self.MAX_VMS}"
+                        )
+                        continue
+
                     timestamp = now.strftime('%Y%m%d%H%M%S')
                     scaled_vm = VirtualMachine(
                         organization_id=vm.organization_id,
@@ -468,6 +512,15 @@ class ResourceSimulator:
                     db.session.flush()
 
                     self.last_scaled_at[vm.instance_id] = now
+
+                    # ── Debug: scaling decision ─────────────────────────────────
+                    print(
+                        f"[AUTOSCALER:SCALE_OUT] DECISION org={org_id} "
+                        f"source_vm={vm.instance_id} new_vm={scaled_vm.instance_id} "
+                        f"trigger=cpu_high({avg_cpu:.1f}%) queue={queue_depth} "
+                        f"total_vms_after={total_active + 1}/{self.MAX_VMS}"
+                    )
+
                     db.session.add(
                         AuditLog(
                             organization_id=org_id,
@@ -528,6 +581,7 @@ class ResourceSimulator:
                             room=f'org_{org_id}',
                             namespace='/metrics',
                         )
+
 
     # ── Queue model constants (work-ms) ──────────────────────────────────────
     _QUEUE_THRESHOLD_MS = 1000.0   # 1s of backlog → overload flag
@@ -1123,6 +1177,7 @@ class ResourceSimulator:
         p95_values: list[float] = []
         total_dropped = 0
         overloaded = 0
+        total_rps = 0
         for vm in running_vms:
             q = self._vm_queue.get(vm.instance_id, 0.0)
             queue_values.append(q)
@@ -1135,6 +1190,13 @@ class ResourceSimulator:
             total_dropped += self._vm_dropped.get(vm.instance_id, 0)
             if q > self._QUEUE_THRESHOLD_MS:
                 overloaded += 1
+            
+            # Aggregate effective RPS from history or base
+            rps_history = self.vm_rps_history.get(vm.instance_id)
+            if rps_history:
+                total_rps += rps_history[-1].get('rps', 0)
+            else:
+                total_rps += int(vm.requests_per_second or 0)
 
         queue_avg = sum(queue_values) / len(queue_values) if queue_values else 0.0
         queue_total = sum(queue_values)
@@ -1184,6 +1246,7 @@ class ResourceSimulator:
             'dropped_recent_total': int(dropped_recent_total),
             'overloaded_vms': overloaded,
             'vm_count': len(running_vms),
+            'requests_per_second': int(total_rps),
             # Deterministic mean: feeds target_bpi (Bug #5 fix).
             'avg_service_time_ms': round(avg_service_time_ms, 3),
         }

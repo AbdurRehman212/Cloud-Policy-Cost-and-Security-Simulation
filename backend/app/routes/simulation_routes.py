@@ -8,7 +8,7 @@ import logging
 from flask import Blueprint, jsonify, request
 from app.utils.dataset_loader import dataset_info
 
-from app.services.simulation_engine import (
+from app.services.simulation_engine_legacy import (
     DEFAULT_NOISE_MAX,
     DEFAULT_NOISE_MIN,
     DEFAULT_POINTS,

@@ -1,6 +1,14 @@
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
 import axios from 'axios';
+import { setCurrentOrganization, switchOrganization } from './organizationSlice';
 const API_URL = 'http://localhost:5000/api';
+
+const getOrgId = (value) => {
+  if (value && typeof value === 'object') {
+    return value.orgId ?? value.organization_id ?? value.org_id ?? null;
+  }
+  return value ?? null;
+};
 
 export const fetchVMs = createAsyncThunk(
   'resources/fetchVMs',
@@ -97,42 +105,105 @@ export const dbAction = createAsyncThunk(
 const resourceSlice = createSlice({
   name: 'resources',
   initialState: {
+    activeOrgId: null,
     vms: [],
     databases: [],
     metrics: null,
     loading: false,
     error: null,
   },
-  reducers: {},
+  reducers: {
+    upsertVM: (state, action) => {
+      const resource = action.payload;
+      if (!resource) return;
+      
+      const id = resource.id || resource.instance_id;
+      const type = resource.type === 'database' ? 'databases' : 'vms';
+      const index = state[type].findIndex(v => v.id === id || v.instance_id === id);
+      
+      if (index !== -1) {
+        state[type][index] = { ...state[type][index], ...resource };
+      } else {
+        state[type].push(resource);
+      }
+    },
+    removeVM: (state, action) => {
+      const id = action.payload;
+      state.vms = state.vms.filter(v => v.id !== id && v.instance_id !== id);
+      state.databases = state.databases.filter(d => d.id !== id && d.instance_id !== id);
+    },
+  },
   extraReducers: (builder) => {
     builder
-      .addCase(fetchVMs.pending, (state) => {
+      .addCase(setCurrentOrganization, (state, action) => {
+        state.activeOrgId = action.payload?.id ?? null;
+        state.vms = [];
+        state.databases = [];
+        state.metrics = null;
+        state.loading = false;
+        state.error = null;
+      })
+      .addCase(switchOrganization, (state, action) => {
+        state.activeOrgId = action.payload?.id ?? null;
+        state.vms = [];
+        state.databases = [];
+        state.metrics = null;
+        state.loading = false;
+        state.error = null;
+      })
+      .addCase(fetchVMs.pending, (state, action) => {
         state.loading = true;
+        state.activeOrgId = getOrgId(action.meta.arg);
       })
       .addCase(fetchVMs.fulfilled, (state, action) => {
+        if (state.activeOrgId !== getOrgId(action.meta.arg)) {
+          return;
+        }
         state.loading = false;
         state.vms = action.payload;
       })
       .addCase(fetchVMs.rejected, (state, action) => {
+        if (state.activeOrgId !== getOrgId(action.meta.arg)) {
+          return;
+        }
         state.loading = false;
         state.error = action.payload;
         state.vms = [];
       })
+      .addCase(fetchDatabases.pending, (state, action) => {
+        state.loading = true;
+        state.activeOrgId = getOrgId(action.meta.arg);
+      })
       .addCase(fetchDatabases.fulfilled, (state, action) => {
+        if (state.activeOrgId !== getOrgId(action.meta.arg)) {
+          return;
+        }
         state.loading = false;
         state.databases = action.payload;
       })
       .addCase(fetchDatabases.rejected, (state, action) => {
+        if (state.activeOrgId !== getOrgId(action.meta.arg)) {
+          return;
+        }
         state.loading = false;
         state.error = action.payload;
         state.databases = [];
       })
       .addCase(createVM.fulfilled, (state, action) => {
+        const orgId = action.payload?.vm?.organization_id ?? action.payload?.organization_id ?? null;
+        if (state.activeOrgId !== null && orgId !== state.activeOrgId) {
+          return;
+        }
         state.vms.push(action.payload.vm);
       })
       .addCase(createDatabase.fulfilled, (state, action) => {
+        const orgId = action.payload?.database?.organization_id ?? action.payload?.organization_id ?? null;
+        if (state.activeOrgId !== null && orgId !== state.activeOrgId) {
+          return;
+        }
         state.databases.push(action.payload.database);
       });
   },
 });
+export const { upsertVM, removeVM } = resourceSlice.actions;
 export default resourceSlice.reducer;

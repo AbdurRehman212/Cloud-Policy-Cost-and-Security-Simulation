@@ -4,11 +4,38 @@ from app import db
 
 
 class ResourceStatus(Enum):
-    PENDING = 'pending'
-    RUNNING = 'running'
-    STOPPED = 'stopped'
+    """VM lifecycle states used throughout the simulation engine.
+
+    Values stored in the DB are the .value strings so the column
+    can be compared as plain VARCHAR (native_enum=False).
+
+    Lifecycle state machine:
+        PENDING (provisioning) → RUNNING
+        RUNNING → OVERLOADED | SCALING | TERMINATED
+        OVERLOADED → RUNNING | SCALING | TERMINATED
+        SCALING    → RUNNING | TERMINATED
+        TERMINATED is terminal
+
+    STOPPED and FAILED are kept for backward-compat with existing DB rows.
+    """
+    # ── Active lifecycle states ────────────────────────────────────────────
+    PENDING    = 'pending'      # alias: provisioning
+    RUNNING    = 'running'
+    OVERLOADED = 'overloaded'
+    SCALING    = 'scaling'
     TERMINATED = 'terminated'
-    FAILED = 'failed'
+    # ── Legacy / compat states ─────────────────────────────────────────────
+    STOPPED    = 'stopped'
+    FAILED     = 'failed'
+
+    @property
+    def is_provisioning(self) -> bool:
+        return self == ResourceStatus.PENDING
+
+    @property
+    def is_deletable(self) -> bool:
+        """A VM is deletable only when it is NOT in the provisioning state."""
+        return self != ResourceStatus.PENDING
 
 
 vm_security_group_links = db.Table(
@@ -89,7 +116,11 @@ class SecurityGroupRule(db.Model):
 
 
 class VirtualMachine(db.Model):
-    """Simulated Virtual Machine."""
+    """Simulated Virtual Machine with full lifecycle state machine.
+
+    States: pending (provisioning) → running → overloaded / scaling → terminated
+    Deletion rule: VM must NOT be in PENDING state to be deleted.
+    """
     __tablename__ = 'virtual_machines'
     id = db.Column(db.Integer, primary_key=True)
     organization_id = db.Column(db.Integer, db.ForeignKey('organizations.id'), nullable=False)
@@ -200,6 +231,7 @@ class Database(db.Model):
     vpc_security_groups = db.Column(db.JSON, default=list)
     # Performance Metrics
     cpu_utilization = db.Column(db.Float, default=0.0)
+    memory_utilization = db.Column(db.Float, default=0.0)
     free_storage_space = db.Column(db.Float, default=0.0)
     read_iops = db.Column(db.Float, default=0.0)
     write_iops = db.Column(db.Float, default=0.0)

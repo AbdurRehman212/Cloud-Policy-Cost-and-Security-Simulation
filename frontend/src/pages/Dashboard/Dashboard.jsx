@@ -1,7 +1,6 @@
 import React, { useEffect, useState, useRef } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import { useNavigate } from "react-router-dom";
-import { io } from "socket.io-client";
 import axios from "axios";
 import {
   ArrowPathIcon,
@@ -31,8 +30,9 @@ import {
   YAxis,
 } from "recharts";
 
-import { fetchDashboardSummary } from "../../store/slices/dashboardSlice";
-import { fetchVMs } from "../../store/slices/resourceSlice";
+import { fetchDashboardSummary, updateDashboardState } from "../../store/slices/dashboardSlice";
+import { fetchVMs, upsertVM, removeVM } from "../../store/slices/resourceSlice";
+import { createSocket } from "../../services/api";
 
 const formatPercent = (value, digits = 2) =>
   `${Number(value || 0).toFixed(digits)}%`;
@@ -136,6 +136,7 @@ const Dashboard = () => {
   const [liveResources, setLiveResources] = useState([]);
   const [socket, setSocket] = useState(null);
   const [progress, setProgress] = useState(null);
+  const [learningProfile, setLearningProfile] = useState(null);
   const [scalingEvents, setScalingEvents] = useState([]);
   const previousQueueRef = useRef(0);
   const [queueTrend, setQueueTrend] = useState("stable");
@@ -171,53 +172,110 @@ const Dashboard = () => {
     loadProgress();
   }, [token, activeOrgId]);
 
-
+  useEffect(() => {
+    if (!token || !activeOrgId) return;
+    const loadLearningProfile = async () => {
+      try {
+        const response = await axios.get(`${API_URL}/learning/experience`, {
+          headers: { Authorization: `Bearer ${token}` },
+          params: { organization_id: activeOrgId },
+        });
+        setLearningProfile(response?.data?.data || null);
+      } catch (error) {
+        setLearningProfile(null);
+      }
+    };
+    loadLearningProfile();
+  }, [token, activeOrgId]);
 
   useEffect(() => {
-    const newSocket = io("http://127.0.0.1:5000/metrics", {
-      transports: ["websocket"],
-      reconnectionAttempts: 5,
-    });
+    if (reduxVms) {
+      setLiveResources(reduxVms);
+    }
+  }, [reduxVms]);
+
+  useEffect(() => {
+    if (!activeOrgId) return;
+
+    const newSocket = createSocket("/metrics");
+    if (!newSocket) return;
+
     setSocket(newSocket);
 
-    newSocket.on("connect", () => {
+    const onConnect = () => {
       setRealtimeStatus("connected");
-    });
+      newSocket.emit("join_room", { room: `org_${activeOrgId}` });
+      console.log("[SOCKET] Connected to /metrics and joined room:", `org_${activeOrgId}`);
+    };
 
-    newSocket.on("dashboard_update", (data) => {
-      dispatch(fetchDashboardSummary(activeOrgId));
+    const onDashboardUpdate = (data) => {
+      console.log("[SOCKET] Received dashboard_update:", data);
+      dispatch(updateDashboardState(data));
       setLastUpdated(new Date(data.timestamp ? data.timestamp * 1000 : Date.now()));
-    });
+    };
 
-    newSocket.on("disconnect", () => {
-      setRealtimeStatus("disconnected");
-    });
-    newSocket.on("connect_error", () => setRealtimeStatus("disconnected"));
-
-    newSocket.on("dashboard:refresh", () => {
-      if (activeOrgId) {
-        dispatch(fetchDashboardSummary(activeOrgId));
-      }
-    });
-
-    // vm_created — immediate notification when a VM/DB is provisioned
-    newSocket.on("vm_created", (resource) => {
+    const onVmCreated = (resource) => {
+      console.log("[SOCKET] Received vm_created:", resource);
       if (!resource?.id) return;
+      dispatch(upsertVM(resource));
       setLiveResources((prev) => {
-        const exists = prev.some((r) => r.id === resource.id);
-        return exists ? prev : [...prev, resource];
+        const exists = prev.some((r) => r.id === resource.id || r.instance_id === resource.instance_id);
+        return exists ? prev.map(r => (r.id === resource.id || r.instance_id === resource.instance_id) ? resource : r) : [...prev, resource];
       });
-    });
+    };
 
-    newSocket.on("metrics:error", (message) => {
+    const onVmUpdated = (resource) => {
+      console.log("[SOCKET] Received vm_updated:", resource);
+      if (!resource?.id) return;
+      dispatch(upsertVM(resource));
+      setLiveResources((prev) => 
+        prev.map(r => (r.id === resource.id || r.instance_id === resource.instance_id) ? resource : r)
+      );
+    };
+
+    const onVmDeleted = (data) => {
+      console.log("[SOCKET] Received vm_deleted:", data);
+      const id = data.id || data.instance_id;
+      if (!id) return;
+      dispatch(removeVM(id));
+      setLiveResources((prev) => prev.filter(r => r.id !== id && r.instance_id !== id));
+    };
+
+    const onRefresh = (data) => {
+      if (data) {
+        dispatch(updateDashboardState(data));
+      }
+    };
+
+    const onError = (message) => {
       setError(
         message?.error?.message ||
           "Live metrics stream is temporarily unavailable.",
       );
-    });
+    };
+
+    newSocket.on("connect", onConnect);
+    newSocket.on("dashboard_update", onDashboardUpdate);
+    newSocket.on("dashboard:refresh", onRefresh);
+    newSocket.on("vm_created", onVmCreated);
+    newSocket.on("vm_updated", onVmUpdated);
+    newSocket.on("vm_deleted", onVmDeleted);
+    newSocket.on("metrics:error", onError);
+    newSocket.on("disconnect", () => setRealtimeStatus("disconnected"));
+    newSocket.on("connect_error", () => setRealtimeStatus("disconnected"));
+
+    if (newSocket.connected) onConnect();
 
     return () => {
-      newSocket.disconnect();
+      newSocket.off("connect", onConnect);
+      newSocket.off("dashboard_update", onDashboardUpdate);
+      newSocket.off("dashboard:refresh", onRefresh);
+      newSocket.off("vm_created", onVmCreated);
+      newSocket.off("vm_updated", onVmUpdated);
+      newSocket.off("vm_deleted", onVmDeleted);
+      newSocket.off("metrics:error", onError);
+      newSocket.off("disconnect");
+      newSocket.off("connect_error");
     };
   }, [activeOrgId, dispatch]);
 
@@ -448,6 +506,79 @@ const Dashboard = () => {
         cloud environment. All resources, security monitoring, and cost tracking
         are centralized under one unified tenant.
       </div>
+
+      {learningProfile?.learning_loop && (
+        <div className="overflow-hidden rounded-3xl border border-primary-200 bg-gradient-to-br from-slate-950 via-slate-900 to-blue-950 p-6 text-white shadow-xl dark:border-primary-900/40">
+          <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
+            <div className="max-w-3xl">
+              <p className="text-xs font-semibold uppercase tracking-[0.3em] text-sky-200/80">
+                Learning command center
+              </p>
+              <h2 className="mt-3 text-2xl font-bold text-white">
+                {learningProfile.recommended_scenario?.title || "Pick a scenario to start learning"}
+              </h2>
+              <p className="mt-2 text-sm text-slate-200">
+                {learningProfile.role_info?.title || "Student"} • {learningProfile.level?.title || "Beginner"} • {learningProfile.level?.focus || "single-service basics"}
+              </p>
+              <p className="mt-4 max-w-2xl text-sm text-slate-300">
+                {learningProfile.learning_loop.explanation?.why_this_changes_metrics || learningProfile.learning_loop.explanation?.why}
+              </p>
+              <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                <div className="rounded-2xl bg-white/10 p-3 backdrop-blur">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-sky-200/80">Track</p>
+                  <p className="mt-1 text-sm font-medium">{learningProfile.selected_level || learningProfile.learning_track || "beginner"}</p>
+                </div>
+                <div className="rounded-2xl bg-white/10 p-3 backdrop-blur">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-sky-200/80">Next action</p>
+                  <p className="mt-1 text-sm font-medium">{learningProfile.learning_loop.explanation?.what_you_changed || learningProfile.learning_loop.action}</p>
+                </div>
+                <div className="rounded-2xl bg-white/10 p-3 backdrop-blur">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-sky-200/80">Progress</p>
+                  <p className="mt-1 text-sm font-medium">{learningProfile.level?.points ?? 0} pts · {learningProfile.level?.points_to_next ?? 0} to next</p>
+                </div>
+              </div>
+            </div>
+            <div className="grid gap-2 text-sm text-slate-200 lg:min-w-[22rem]">
+              {[
+                ["User", learningProfile.learning_loop.user],
+                ["Scenario", learningProfile.learning_loop.scenario],
+                ["Action", learningProfile.learning_loop.action],
+                ["Simulation", learningProfile.learning_loop.simulation],
+                ["Result", learningProfile.learning_loop.result],
+              ].map(([label, value]) => (
+                <div key={label} className="rounded-xl bg-white/10 px-3 py-2 backdrop-blur">
+                  <strong>{label}:</strong> {value}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="mt-5 flex flex-wrap gap-2">
+            {learningProfile.progression_path?.map((item) => (
+              <span
+                key={item.level}
+                className="rounded-full bg-white/10 px-3 py-1 text-xs font-semibold text-white/90"
+              >
+                {item.title}
+              </span>
+            ))}
+          </div>
+          {learningProfile.progress_timeline?.length > 0 && (
+            <div className="mt-5 rounded-2xl bg-white/5 p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-sky-200/80">
+                Score trend
+              </p>
+              <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                {learningProfile.progress_timeline.slice(-3).map((entry) => (
+                  <div key={`${entry.scenario_id}-${entry.updated_at || entry.completed_at}`} className="rounded-xl bg-white/10 px-3 py-2">
+                    <p className="text-sm font-medium text-white">{entry.scenario_title}</p>
+                    <p className="text-xs text-slate-300">{entry.points_earned} pts · {entry.completed ? "completed" : `step ${entry.current_step}`}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>

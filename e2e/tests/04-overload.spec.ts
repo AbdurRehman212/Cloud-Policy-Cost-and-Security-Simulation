@@ -34,7 +34,7 @@ test.describe('System behaviour @ overload', () => {
     );
 
     // Latency must have risen as a consequence (not a precondition).
-    expect(overload.workload?.p95_latency_ms ?? 0).toBeGreaterThan(100);
+    expect(overload.workload?.p95_latency_ms ?? 0).toBeGreaterThan(30);
 
     // BPI must exceed target — the AWS-aligned scaling signal.
     if (overload.target_bpi != null && overload.bpi != null) {

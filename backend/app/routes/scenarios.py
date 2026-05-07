@@ -13,6 +13,7 @@ from app.models.settings import UserSettings
 from app.services.learning_engine import (
     curriculum_limit,
     evaluate_scenario_decision,
+    lab_validation_engine,
     learning_loop_for_scenario,
     next_unlocked_scenario,
     normalize_learning_level,
@@ -30,13 +31,6 @@ def _error(message, status_code=400, code='bad_request'):
 
 def _resolve_org_id_for_user(user_id, preferred_org_id=None):
     memberships = OrganizationMember.query.filter_by(user_id=user_id).all()
-    if not memberships:
-        user = User.query.get(user_id)
-        if user:
-            ensure_default_organization_membership(user)
-            db.session.commit()
-            memberships = OrganizationMember.query.filter_by(user_id=user_id).all()
-
     if not memberships:
         return None
 
@@ -89,13 +83,13 @@ def _selected_learning_track(user_id, progress=None, preferred=None):
     return normalize_learning_level(preferred or stored or getattr(progress, 'learning_stage', None))
 
 
-def _scenario_is_locked(user_id, progress, scenario_id, track):
+def _scenario_is_locked(user_id, org_id, progress, scenario_id, track):
     next_scenario = next_unlocked_scenario(progress=progress, level=track)
     next_scenario_id = next_scenario.get('id') if next_scenario else None
     lock_limit = curriculum_limit(track)
     member = None
     try:
-        member = OrganizationMember.query.filter_by(user_id=user_id).first()
+        member = OrganizationMember.query.filter_by(organization_id=org_id, user_id=user_id).first()
     except Exception:
         member = None
     if member and member.role in {'admin', 'owner'}:
@@ -114,7 +108,7 @@ def _scenario_is_locked(user_id, progress, scenario_id, track):
 
 def _scenario_access_payload(user_id, org_id, scenario, progress=None, preferred_track=None):
     track = _selected_learning_track(user_id, progress=progress, preferred=preferred_track)
-    locked, reason = _scenario_is_locked(user_id, progress, scenario['id'], track)
+    locked, reason = _scenario_is_locked(user_id, org_id, progress, scenario['id'], track)
     payload = _scenario_payload(scenario, progress)
     payload.update({
         'learning_track': track,
@@ -127,6 +121,27 @@ def _scenario_access_payload(user_id, org_id, scenario, progress=None, preferred
         'unlock_state': scenario_unlock_state(progress=progress, level=track),
     })
     return payload, locked, reason
+
+
+def _record_lab3_progress(progress, step_id, evaluation):
+    """Persist deterministic Lab 3 step progression and validation history."""
+    history = list(progress.history or [])
+    history.append({
+        'timestamp': datetime.utcnow().isoformat(),
+        'step_id': step_id,
+        'validation_type': 'lab3_state_predicates',
+        'valid': True,
+        'score': evaluation.get('score'),
+        'grade': evaluation.get('grade'),
+        'state': evaluation.get('state', {}),
+        'predicates': evaluation.get('predicates', []),
+    })
+    progress.history = history[-20:]
+    progress.current_step = max(progress.current_step or 0, int(step_id))
+    if progress.current_step >= 3:
+        progress.completed = True
+        if not progress.completed_at:
+            progress.completed_at = datetime.utcnow()
 
 @scenarios_bp.route('', methods=['GET'])
 @jwt_required()
@@ -161,7 +176,12 @@ def list_scenarios():
 @jwt_required()
 def get_scenario_detail(scenario_id):
     user_id = int(get_jwt_identity())
-    scenario = SCENARIO_MAP.get(scenario_id)
+    try:
+        s_id_int = int(scenario_id)
+    except (TypeError, ValueError):
+        return _error('Invalid scenario ID', status_code=400)
+    scenario = SCENARIO_MAP.get(s_id_int)
+    scenario_id = str(scenario_id)
     if not scenario:
         return _error('Scenario not found', status_code=404, code='not_found')
 
@@ -187,7 +207,12 @@ def get_scenario_detail(scenario_id):
 @jwt_required()
 def save_scenario_progress(scenario_id):
     user_id = int(get_jwt_identity())
-    scenario = SCENARIO_MAP.get(scenario_id)
+    try:
+        s_id_int = int(scenario_id)
+    except (TypeError, ValueError):
+        return _error('Invalid scenario ID', status_code=400)
+    scenario = SCENARIO_MAP.get(s_id_int)
+    scenario_id = str(scenario_id)
     if not scenario:
         return _error('Scenario not found', status_code=404, code='not_found')
 
@@ -250,7 +275,12 @@ def save_scenario_progress(scenario_id):
 @jwt_required()
 def get_scenario_progress(scenario_id):
     user_id = int(get_jwt_identity())
-    scenario = SCENARIO_MAP.get(scenario_id)
+    try:
+        s_id_int = int(scenario_id)
+    except (TypeError, ValueError):
+        return _error('Invalid scenario ID', status_code=400)
+    scenario = SCENARIO_MAP.get(s_id_int)
+    scenario_id = str(scenario_id)
     if not scenario:
         return _error('Scenario not found', status_code=404, code='not_found')
 
@@ -275,7 +305,12 @@ def get_scenario_progress(scenario_id):
 @jwt_required()
 def validate_step(scenario_id):
     user_id = int(get_jwt_identity())
-    scenario = SCENARIO_MAP.get(scenario_id)
+    try:
+        s_id_int = int(scenario_id)
+    except (TypeError, ValueError):
+        return _error('Invalid scenario ID', status_code=400)
+    scenario = SCENARIO_MAP.get(s_id_int)
+    scenario_id = str(scenario_id)
     if not scenario:
         return _error('Scenario not found', status_code=404, code='not_found')
 
@@ -305,10 +340,50 @@ def validate_step(scenario_id):
     valid = False
     message = ''
     snapshot = control_plane.get_org_snapshot(org_id, use_cache=True)
+    try:
+        step_id = int(step_id)
+    except (TypeError, ValueError):
+        return _error('Invalid step ID', status_code=400)
 
-    from app.models.resources import VirtualMachine, ResourceStatus
-    from app.models.security import SecurityGroup, ThreatDetection
+    from app.models.resources import VirtualMachine, ResourceStatus, SecurityGroup
+    from app.models.security import ThreatDetection
     from app.models.cost import Budget
+
+    if scenario['id'] == lab_validation_engine.LAB3_SCENARIO_ID:
+        lab_result = lab_validation_engine.evaluate_lab3_step(org_id, scenario, step, snapshot)
+        valid = lab_result['valid']
+        message = lab_result['message']
+        evaluation = lab_result['evaluation']
+        if valid:
+            if not progress:
+                progress = ScenarioProgress(
+                    user_id=user_id,
+                    org_id=org_id,
+                    scenario_id=scenario_id,
+                    current_step=0,
+                    completed=False,
+                    started_at=datetime.utcnow(),
+                    points_earned=0,
+                    history=[],
+                )
+                db.session.add(progress)
+            _record_lab3_progress(progress, step_id, evaluation)
+            db.session.commit()
+        include_ai = data.get('include_ai', False)
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'valid': valid,
+                'message': message,
+                'learning_loop': scenario.get('learning_loop', {}),
+                'cause_effect': scenario.get('cause_effect', {}),
+                'snapshot': snapshot,
+                'evaluation': evaluation,
+                'state': lab_result.get('state', {}),
+                'predicates': lab_result.get('predicates', []),
+                'targets': lab_result.get('targets', {}),
+            },
+        }), 200
 
     if validation_type == 'vm_exists':
         vm = VirtualMachine.query.filter_by(
@@ -423,7 +498,8 @@ def validate_step(scenario_id):
         valid = False
         message = f'Unknown validation type: {validation_type}'
 
-    evaluation = evaluate_scenario_decision(scenario, snapshot)
+    include_ai = data.get('include_ai', False)
+    evaluation = evaluate_scenario_decision(scenario, snapshot, include_ai=include_ai)
     return jsonify({
         'status': 'success',
         'data': {
@@ -441,7 +517,12 @@ def validate_step(scenario_id):
 @jwt_required()
 def complete_scenario(scenario_id):
     user_id = int(get_jwt_identity())
-    scenario = SCENARIO_MAP.get(scenario_id)
+    try:
+        s_id_int = int(scenario_id)
+    except (TypeError, ValueError):
+        return _error('Invalid scenario ID', status_code=400)
+    scenario = SCENARIO_MAP.get(s_id_int)
+    scenario_id = str(scenario_id)
     if not scenario:
         return _error('Scenario not found', status_code=404, code='not_found')
 
@@ -479,7 +560,17 @@ def complete_scenario(scenario_id):
         progress.current_step = len(scenario.get('steps', []))
 
     snapshot = control_plane.get_org_snapshot(org_id, use_cache=True)
-    evaluation = evaluate_scenario_decision(scenario, snapshot)
+    include_ai = data.get('include_ai', False)
+    evaluation = evaluate_scenario_decision(scenario, snapshot, include_ai=include_ai)
+
+    history = list(progress.history or [])
+    history.append({
+        'timestamp': datetime.utcnow().isoformat(),
+        'action': 'complete',
+        'score': evaluation.get('score'),
+        'grade': evaluation.get('grade')
+    })
+    progress.history = history
 
     db.session.commit()
     return jsonify({
@@ -490,3 +581,86 @@ def complete_scenario(scenario_id):
             'evaluation': evaluation,
         },
     }), 200
+
+
+@scenarios_bp.route('/<scenario_id>/run', methods=['POST'])
+@jwt_required()
+def run_scenario(scenario_id):
+    """Start a scenario simulation run via SimulationEngine.start_scenario().
+
+    Returns 202 Accepted immediately.
+    The engine manages its own background thread — no task spawning here.
+    Returns 409 if already running.
+    """
+    user_id = int(get_jwt_identity())
+
+    try:
+        sid = int(scenario_id)
+    except (TypeError, ValueError):
+        return _error('Invalid scenario ID', status_code=400)
+
+    scenario = SCENARIO_MAP.get(sid)
+    if not scenario:
+        return _error('Scenario not found', status_code=404, code='not_found')
+
+    data = request.get_json() or {}
+    org_id = data.get('org_id') or data.get('organization_id')
+    org_id = _resolve_org_id_for_user(user_id, org_id)
+    if org_id is None:
+        return _error('Access denied', status_code=403, code='forbidden')
+    if not _check_org_access(user_id, org_id, 'member'):
+        return _error('Access denied', status_code=403, code='forbidden')
+
+    from app import simulation_engine
+    from app.services.scenario_runner import scenario_runner
+
+    result = scenario_runner.start(scenario_id=sid, org_id=org_id)
+
+    if not result.get('ok'):
+        return jsonify({
+            'status': 'error',
+            'error': {
+                'message': result.get('error', 'Failed to start scenario.'),
+                'code': result.get('code', 'scenario_error'),
+            },
+        }), 409
+
+    return jsonify({'status': 'success', 'data': result}), 202
+
+
+@scenarios_bp.route('/<scenario_id>/run/status', methods=['GET'])
+@jwt_required()
+def run_scenario_status(scenario_id):
+    """Check whether a scenario simulation run is active for an org."""
+    user_id = int(get_jwt_identity())
+    org_id = request.args.get('organization_id', type=int)
+    org_id = _resolve_org_id_for_user(user_id, org_id)
+    if org_id is None:
+        return _error('Access denied', status_code=403, code='forbidden')
+
+    from app.services.scenario_runner import scenario_runner
+    return jsonify({
+        'status': 'success',
+        'data': {
+            **scenario_runner.get_state(org_id),
+            'scenario_id': scenario_id,
+        },
+    }), 200
+
+
+@scenarios_bp.route('/<scenario_id>/run/stop', methods=['POST'])
+@jwt_required()
+def stop_scenario_run(scenario_id):
+    """Stop an active scenario simulation run."""
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+    org_id = data.get('org_id') or data.get('organization_id')
+    org_id = _resolve_org_id_for_user(user_id, org_id)
+    if org_id is None:
+        return _error('Access denied', status_code=403, code='forbidden')
+    if not _check_org_access(user_id, org_id, 'member'):
+        return _error('Access denied', status_code=403, code='forbidden')
+
+    from app.services.scenario_runner import scenario_runner
+    scenario_runner.stop(org_id)
+    return jsonify({'status': 'success', 'data': {'stopped': True, 'org_id': org_id}}), 200

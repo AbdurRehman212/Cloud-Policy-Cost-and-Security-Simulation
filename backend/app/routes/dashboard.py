@@ -2,10 +2,13 @@ from flask import Blueprint, jsonify, request, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app.models.organization import OrganizationMember
 from app.models.governance import Policy
+from app.models.progress import UserProgress
 from app.models.resources import VirtualMachine, Database, ResourceStatus
 from app.models.security import ThreatDetection, ThreatSeverity
 from app.models.cost import CostRecord, Budget
+from app.models.user import User
 from app.services import control_plane
+from app.services.learning_engine import build_learning_profile, explain_metric_change
 from datetime import datetime, timedelta
 import time
 dashboard_bp = Blueprint('dashboard', __name__)
@@ -50,7 +53,7 @@ def get_dashboard_summary():
     budgets = Budget.query.filter_by(organization_id=org_id, is_active=True).all()
     
     # Security score: 100 - (critical*20 + high*10 + medium*5)
-    threats = ThreatDetection.query.filter_by(organization_id=org_id).all()
+    threats = ThreatDetection.query.filter_by(organization_id=org_id, status='active').all()
     critical_count = sum(1 for t in threats if t.severity == ThreatSeverity.CRITICAL)
     high_count = sum(1 for t in threats if t.severity == ThreatSeverity.HIGH)
     medium_count = sum(1 for t in threats if t.severity == ThreatSeverity.MEDIUM)
@@ -103,9 +106,7 @@ def get_dashboard_summary():
     # by background task).  Never recompute inside the request handler.
     # use_cache=True is the default so this returns instantly from memory.
     sim_snapshot_data = control_plane.get_org_snapshot(org_id, use_cache=True)
-    # Lightweight dashboard snapshot (cost_trend, utilization_trend, recent_activity)
-    # from the ResourceSimulator — also from in-memory history, no DB hit.
-    simulator_snapshot = current_app.simulator.get_dashboard_snapshot(org_id)
+    simulator_snapshot = sim_snapshot_data
 
     if use_resource_metrics:
         # Read live utilization directly from the DB models
@@ -143,10 +144,25 @@ def get_dashboard_summary():
             }],
         }
 
-    # TASK 3 + TASK 7: sim_snapshot_data was already read from the in-memory
-    # cache at the top of this handler.  Re-using it here ensures zero
-    # simulation computation inside the request path.
     sim_data = sim_snapshot_data
+    snapshot_security = sim_data.get('security', {})
+    snapshot_costs = sim_data.get('costs', {})
+    snapshot_governance = sim_data.get('governance', {})
+
+    active_threats = snapshot_security.get('active_threats', active_threats)
+    security_score = snapshot_security.get('security_score', security_score)
+    current_spend = snapshot_costs.get('current_month_spend', current_spend)
+    monthly_spend = snapshot_costs.get('monthly_spend', monthly_spend)
+    budgets = snapshot_costs.get('budgets', budget_status)
+    compliance_score = snapshot_governance.get('compliance_score', compliance_score)
+
+    total_vms = sim_data.get('total_vms', total_vms)
+    running_vms = sim_data.get('running_vms', running_vms)
+
+    user = User.query.get(user_id)
+    progress = UserProgress.query.filter_by(user_id=user_id, org_id=org_id).first()
+    learning_profile = build_learning_profile(user=user, membership=member, progress=progress, snapshot=sim_data)
+    learning_explanation = explain_metric_change(learning_profile.get('recommended_scenario') or {}, sim_data)
 
     # TASK 6: Log API response time for performance monitoring.
     response_ms = round((time.time() - t0) * 1000, 1)
@@ -157,23 +173,49 @@ def get_dashboard_summary():
     )
     print(f"[PERF] /api/dashboard/summary response time: {response_ms} ms")
 
+    # Extract causal metrics for learning feedback
+    workload = sim_data.get('workload', {})
+    q_ms = workload.get('queue_total_ms', 0)
+    rps = workload.get('requests_per_second', 0)
+    capacity = sim_data.get('capacity', 1)
+    drops = workload.get('dropped_recent_total', 0)
+
+    if q_ms > 1000:
+        res_exp = f"Queue is high ({q_ms:.0f}ms) because load ({rps} RPS) exceeds drain capacity of {capacity} VMs."
+        res_act = "Scale out VMs to increase capacity and drain the queue, preventing dropped requests."
+    elif drops > 0:
+        res_exp = f"System is overloaded! {drops} requests dropped because {capacity} VMs cannot handle {rps} RPS."
+        res_act = "Immediately provision more VMs to restore availability."
+    elif capacity > 0 and rps == 0:
+        res_exp = f"{capacity} VMs are running idle with 0 RPS load."
+        res_act = "Scale in to 0 or 1 VMs to stop wasting budget on idle resources."
+    else:
+        res_exp = f"System is stable. {capacity} VMs are comfortably processing {rps} RPS."
+        res_act = "Monitor load trends to ensure you are not over-provisioned."
+
     return jsonify({
         'resources': {
             'vms': {
                 'total': total_vms,
                 'running': simulator_snapshot.get('running_vm_count', running_vms)
             },
-            'databases': {'total': total_dbs, 'running': running_dbs}
+            'databases': {'total': total_dbs, 'running': running_dbs},
+            'explanation': res_exp,
+            'actionable_suggestion': res_act
         },
         'security': {
             'active_threats': active_threats,
             'status': 'critical' if active_threats > 0 else 'healthy',
-            'security_score': security_score
+            'security_score': security_score,
+            'explanation': f"Security score is {security_score}/100 with {active_threats} active threats.",
+            'actionable_suggestion': 'Investigate and resolve active threats to improve score.' if active_threats > 0 else 'Keep security groups tight to maintain your perfect score.'
         },
         'costs': {
             'current_month_spend': round(current_spend, 2),
             'monthly_spend': round(monthly_spend, 2),
-            'budgets': budget_status
+            'budgets': budget_status,
+            'explanation': f"Current spend is ${round(current_spend, 2)}.",
+            'actionable_suggestion': 'Create a budget to track spending against limits.' if not budgets else 'Check for unutilized resources.'
         },
         'cost_trend': simulator_snapshot.get('cost_trend', []),
         'utilization_trend': simulator_snapshot.get('utilization_trend', []),
@@ -187,6 +229,20 @@ def get_dashboard_summary():
             active_threats, running_vms, total_vms, current_spend, budgets
         ),
         'health_score_calculated': health_score_calculated,
+        'coaching': {
+            'utilization': {
+                'explanation': f"Average utilization score is {round(utilization_score, 1)}%.",
+                'actionable_suggestion': 'Scale in to improve efficiency.' if utilization_score < 40 else 'Scale out to prevent performance degradation.' if utilization_score > 80 else 'Good utilization balance.'
+            },
+            'compliance': {
+                'explanation': f"Compliance score is {compliance_score}/100.",
+                'actionable_suggestion': 'Review failed policy checks.' if compliance_score < 100 else 'System is fully compliant.'
+            },
+            'health': {
+                'explanation': f"Overall system health score is {health_score_calculated}/100.",
+                'actionable_suggestion': 'Check for failing metrics across security, utilization, or cost.' if health_score_calculated < 80 else 'System is performing optimally.'
+            }
+        },
         # Simulation data for E2E tests
         'cpu_avg': sim_data.get('cpu_avg', 0),
         'memory_avg': sim_data.get('memory_avg', 0),
@@ -200,8 +256,40 @@ def get_dashboard_summary():
         'actions': sim_data.get('actions', []),
         'alert_states': sim_data.get('alert_states', {}),
         'learning_insight': sim_data.get('learning_insight', {}),
+        'learning_profile': learning_profile,
+        'learning_loop': learning_profile.get('learning_loop'),
+        'learning_role': learning_profile.get('role'),
+        'learning_level': learning_profile.get('level'),
+        'recommended_scenario': learning_profile.get('recommended_scenario'),
+        'learning_explanation': learning_explanation,
         'timestamp': datetime.utcnow().timestamp()
     }), 200
+
+
+def calculate_health_score(active_threats, running_vms, total_vms, current_spend, budgets):
+    """Return a bounded dashboard health score from security, utilization, and cost signals."""
+    score = 100
+    score -= min(40, int(active_threats) * 20)
+
+    if total_vms > 0:
+        utilization_ratio = (running_vms / total_vms) * 100
+        if utilization_ratio < 20:
+            score -= 10
+        elif utilization_ratio > 90:
+            score -= 10
+
+    if budgets:
+        if any(budget.get('alert_level') == 'critical' for budget in budgets):
+            score -= 15
+        elif any(budget.get('alert_level') == 'warning' for budget in budgets):
+            score -= 5
+
+    if current_spend <= 0:
+        score -= 0
+
+    return max(0, min(100, score))
+
+
 @dashboard_bp.route('/cost-by-resource', methods=['GET'])
 @jwt_required()
 def cost_by_resource():
@@ -238,22 +326,5 @@ def cost_by_resource():
             'cost': cost,
             'instance_type': db_obj.instance_class,
         })
-    items.sort(key=lambda x: x['cost'], reverse=True)
-    return jsonify({'status': 'success', 'data': items}), 200
-
-
-def calculate_health_score(threats, running_vms, total_vms, spend, budgets):
-    """Calculate overall infrastructure health score."""
-    score = 100
-    # Deduct for threats
-    score -= threats * 20
-    # Deduct for low utilization
-    if total_vms > 0:
-        utilization_rate = running_vms / total_vms
-        if utilization_rate < 0.3:
-            score -= 10
-    # Deduct for budget overruns
-    for b in budgets:
-        if b.get_current_spend() > b.amount:
-            score -= 15
-    return max(0, min(100, score))
+    items.sort(key=lambda item: item['cost'], reverse=True)
+    return jsonify({'items': items}), 200

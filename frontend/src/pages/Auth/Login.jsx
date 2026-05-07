@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useDispatch, useSelector } from 'react-redux';
 import { login, clearError } from '../../store/slices/authSlice';
@@ -7,22 +7,36 @@ const Login = () => {
   const dispatch = useDispatch();
   const navigate = useNavigate();
   const { loading, error, isAuthenticated } = useSelector((state) => state.auth);
+  const submitLockRef = useRef(false);
   const [formData, setFormData] = useState({
     email: '',
     password: '',
   });
+
   useEffect(() => {
     if (isAuthenticated) {
-      navigate('/');
+      navigate('/', { replace: true });
     }
+  }, [isAuthenticated, navigate]);
+
+  useEffect(() => {
     if (error) {
       toast.error(error);
       dispatch(clearError());
     }
-  }, [isAuthenticated, error, navigate, dispatch]);
+  }, [error, navigate, dispatch]);
   const handleSubmit = async (e) => {
     e.preventDefault();
-    dispatch(login(formData));
+    if (loading || submitLockRef.current) return;
+    submitLockRef.current = true;
+    try {
+      const result = await dispatch(login(formData));
+      if (login.fulfilled.match(result)) {
+        navigate('/', { replace: true });
+      }
+    } finally {
+      submitLockRef.current = false;
+    }
   };
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-primary-50 to-primary-100 dark:from-gray-900 dark:to-gray-800">

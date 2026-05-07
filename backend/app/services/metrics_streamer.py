@@ -6,7 +6,7 @@ import logging
 from threading import Lock
 
 from app import socketio
-from app.services.simulation_engine import METRIC_INTERVAL_SECONDS, generate_metrics
+from app.services.simulation_engine_legacy import METRIC_INTERVAL_SECONDS, generate_metrics
 
 
 logger = logging.getLogger(__name__)

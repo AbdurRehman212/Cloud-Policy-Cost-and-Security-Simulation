@@ -1,9 +1,6 @@
-import React, { useEffect } from "react";
+import React from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
-import { useDispatch, useSelector } from "react-redux";
-import { fetchProfile } from "./store/slices/authSlice";
-import { fetchOrganizations } from "./store/slices/organizationSlice";
-import { fetchVMs } from "./store/slices/resourceSlice";
+import { useSelector } from "react-redux";
 import Layout from "./components/Layout/Layout";
 import Login from "./pages/Auth/Login";
 import Register from "./pages/Auth/Register";
@@ -25,22 +22,6 @@ const PrivateRoute = ({ children }) => {
   return isAuthenticated ? children : <Navigate to="/login" />;
 };
 function App() {
-  const dispatch = useDispatch();
-  const { isAuthenticated } = useSelector((state) => state.auth);
-  const currentOrgId = useSelector(
-    (state) => state.organization.currentOrganization?.id
-  );
-  useEffect(() => {
-    if (isAuthenticated) {
-      dispatch(fetchProfile());
-      dispatch(fetchOrganizations());
-    }
-  }, [dispatch, isAuthenticated]);
-  useEffect(() => {
-    if (currentOrgId) {
-      dispatch(fetchVMs(currentOrgId));
-    }
-  }, [currentOrgId, dispatch]);
   return (
     <Routes>
       <Route path="/login" element={<Login />} />

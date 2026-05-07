@@ -60,13 +60,6 @@ def list_organizations():
     user_id = get_jwt_identity()
     memberships = OrganizationMember.query.filter_by(user_id=user_id).all()
 
-    if not memberships:
-        user = User.query.get(user_id)
-        if user:
-            ensure_default_organization_membership(user)
-            db.session.commit()
-            memberships = OrganizationMember.query.filter_by(user_id=user_id).all()
-
     orgs = []
     for membership in memberships:
         org = membership.organization

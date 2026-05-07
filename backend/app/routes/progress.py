@@ -28,13 +28,7 @@ def _resolve_org_id_for_user(user_id, preferred_org_id=None):
                 return preferred_org_id
         return sorted(allowed)[0]
     
-    # Ensure default organization if no memberships
-    user = User.query.get(user_id)
-    if not user:
-        return None
-    organization, _, _ = ensure_default_organization_membership(user)
-    db.session.commit()
-    return organization.id
+    return None
 
 
 def _get_or_create_progress(user_id, org_id):

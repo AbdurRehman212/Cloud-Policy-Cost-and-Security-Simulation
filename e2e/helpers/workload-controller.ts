@@ -48,6 +48,7 @@ export class WorkloadController {
     }
     this.created = [];
     await this.api.terminateAllByPrefix(this.prefix);
+    await this.api.terminateAllByPrefix('autoscale');
   }
 
   get prefixId(): string {

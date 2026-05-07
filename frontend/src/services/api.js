@@ -41,34 +41,38 @@ export default apiClient;
  * Create a Socket.IO connection to the backend.
  * Use this everywhere instead of direct `io()` calls.
  */
-let socketInstance = null;
-
-export const createSocket = () => {
+export const createSocket = (namespace = '') => {
   const token = localStorage.getItem('token') || '';
   if (!token) {
     return null;
   }
 
-  if (socketInstance) {
-    const currentToken = socketInstance.auth?.token || '';
-    if (currentToken === token && socketInstance.connected) {
-      return socketInstance;
-    }
+  // Ensure namespace starts with /
+  const ns = namespace && !namespace.startsWith('/') ? `/${namespace}` : namespace;
 
-    socketInstance.disconnect();
-    socketInstance.close();
-    socketInstance = null;
+  // We keep a registry of instances per namespace
+  if (!window._socketInstances) window._socketInstances = {};
+
+  if (window._socketInstances[ns]) {
+    const existing = window._socketInstances[ns];
+    if (existing.connected && existing.auth?.token === token) {
+      return existing;
+    }
+    existing.disconnect();
+    delete window._socketInstances[ns];
   }
 
-  socketInstance = io({
-    transports: ['polling'],
-    autoConnect: false,
+  const socket = io(ns, {
+    transports: ['websocket', 'polling'],
+    autoConnect: true,
     auth: {
       token,
     },
-    reconnection: false,
-    timeout: 10000,
+    reconnection: true,
+    reconnectionAttempts: 10,
+    timeout: 20000,
   });
-  socketInstance.connect();
-  return socketInstance;
+
+  window._socketInstances[ns] = socket;
+  return socket;
 };

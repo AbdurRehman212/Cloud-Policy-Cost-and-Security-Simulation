@@ -19,6 +19,8 @@ from app.models.resources import VirtualMachine, Database, ResourceStatus
 _snapshot_cache: dict[int, dict] = {}
 _cache_lock = threading.Lock()
 _cache_ttl = 2.0  # seconds between recomputes
+_control_plane_task = None
+_control_plane_lock = threading.Lock()
 
 # In-memory storage for CPU history per organization (max 5 entries)
 cpu_history: dict[int, list] = {}
@@ -46,6 +48,7 @@ _CAPACITY_MAX = 10
 _SCALE_IN_BPI_RATIO = 0.7       # AWS recommended: 70% of target triggers scale-in
 # Hard step cap: never add/remove more than this many instances per evaluation.
 _MAX_STEP = 3
+_GLOBAL_MAX_VMS = 100
 
 # ── VM provisioning helpers for autoscaling execution ──────────────────────────
 
@@ -64,9 +67,12 @@ def _generate_instance_id(prefix: str = "i") -> str:
 
 def _create_autoscale_vm(org_id: int, instance_type: str, base_rps: int, pattern: str) -> VirtualMachine:
     """Create and commit a RUNNING VM for autoscaling execution."""
-    current_count = VirtualMachine.query.filter_by(organization_id=org_id, status=ResourceStatus.RUNNING).count()
-    if current_count >= 20:
-        raise Exception("Organization has reached the maximum allowed limit of 20 VMs.")
+    from app.models.resources import Database
+    current_vms = VirtualMachine.query.filter_by(organization_id=org_id).filter(VirtualMachine.status != ResourceStatus.TERMINATED).count()
+    current_dbs = Database.query.filter_by(organization_id=org_id).filter(Database.status != ResourceStatus.TERMINATED).count()
+    if current_vms + current_dbs >= _GLOBAL_MAX_VMS:
+        raise Exception(f"Organization has reached the maximum allowed limit of {_GLOBAL_MAX_VMS} resources.")
+    
     spec = _INSTANCE_SPECS.get(instance_type, _INSTANCE_SPECS["t2.medium"])
     vm = VirtualMachine(
         organization_id=org_id,
@@ -126,13 +132,26 @@ def _terminate_autoscale_vm(org_id: int) -> bool:
 def _workload_snapshot_for(org_id: int) -> dict:
     """Pull the simulator's per-org queue/latency aggregate. Safe on no-sim."""
     try:
+        from app import simulation_engine
+        state = simulation_engine.get_state(org_id)
+        if state and state.get('is_running'):
+            metrics = state.get('metrics', {})
+            return {
+                'queue_total_ms': metrics.get('queue_depth', 0) * 10, # Mock scale for UI
+                'latency_avg_ms': metrics.get('latency_ms', 0),
+                'p95_latency_ms': metrics.get('latency_ms', 0) * 1.2,
+                'dropped_recent_total': state.get('dropped_requests', 0),
+                'vm_count': state.get('vm_count', 0),
+                'avg_service_time_ms': 5.0,
+                'requests_per_second': metrics.get('incoming_rps', 0)
+            }
+            
         from flask import current_app
-        sim = getattr(current_app, 'simulator', None)
-        if sim is None or not hasattr(sim, 'get_org_workload_snapshot'):
-            return {}
-        return sim.get_org_workload_snapshot(org_id) or {}
-    except Exception:
-        # Never let monitoring errors propagate into the request path.
+        if hasattr(current_app, 'simulator'):
+            return current_app.simulator.get_org_workload_snapshot(org_id)
+        return {}
+    except Exception as e:
+        print(f"[CONTROL_PLANE] Error pulling from engine: {e}")
         return {}
 
 
@@ -143,6 +162,193 @@ def _topology_for(org_id: int) -> dict:
         return aggregate_via_topology(org_id)
     except Exception:
         return {}
+
+
+def _security_for(org_id: int) -> dict:
+    """Build org security metrics from persisted threat state."""
+    try:
+        from app.models.security import ThreatDetection, ThreatSeverity
+
+        threats = ThreatDetection.query.filter_by(organization_id=org_id, status='active').all()
+        active_threats = len(threats)
+        critical_count = sum(1 for threat in threats if threat.severity == ThreatSeverity.CRITICAL)
+        high_count = sum(1 for threat in threats if threat.severity == ThreatSeverity.HIGH)
+        medium_count = sum(1 for threat in threats if threat.severity == ThreatSeverity.MEDIUM)
+        security_score = max(0, min(100, 100 - (critical_count * 20 + high_count * 10 + medium_count * 5)))
+
+        return {
+            'active_threats': active_threats,
+            'security_score': security_score,
+            'threats_by_severity': {
+                'critical': critical_count,
+                'high': high_count,
+                'medium': medium_count,
+            },
+            'latest_threats': [threat.to_dict() for threat in threats[:5]],
+        }
+    except Exception:
+        return {
+            'active_threats': 0,
+            'security_score': 100,
+            'threats_by_severity': {'critical': 0, 'high': 0, 'medium': 0},
+            'latest_threats': [],
+        }
+
+
+def _cost_for(org_id: int) -> dict:
+    """Build org cost metrics from persisted cost and budget state."""
+    try:
+        from app.models.cost import CostRecord, Budget
+
+        today = datetime.utcnow().date()
+        month_start = today.replace(day=1)
+        records = CostRecord.query.filter(
+            CostRecord.organization_id == org_id,
+            CostRecord.date >= month_start,
+        ).all()
+
+        by_service: dict[str, float] = {}
+        by_day: dict[str, float] = {}
+        current_month_spend = 0.0
+        for record in records:
+            current_month_spend += float(record.total_cost or 0)
+            by_service[record.resource_type] = by_service.get(record.resource_type, 0.0) + float(record.total_cost or 0)
+            by_day[str(record.date)] = by_day.get(str(record.date), 0.0) + float(record.total_cost or 0)
+
+        budgets = Budget.query.filter_by(organization_id=org_id, is_active=True).all()
+        budget_status = []
+        for budget in budgets:
+            status = budget.to_dict()
+            status['alert_level'] = 'normal'
+            if status['percentage_used'] > 100:
+                status['alert_level'] = 'critical'
+            elif status['percentage_used'] > 80:
+                status['alert_level'] = 'warning'
+            budget_status.append(status)
+
+        return {
+            'current_month_spend': round(current_month_spend, 2),
+            'monthly_spend': round(current_month_spend, 2),
+            'by_service': {k: round(v, 2) for k, v in by_service.items()},
+            'by_day': {k: round(v, 2) for k, v in sorted(by_day.items())},
+            'projected_month_end': round(current_month_spend / max(1, today.day) * 30, 2),
+            'budgets': budget_status,
+            'budget_count': len(budget_status),
+            'over_budget_count': sum(1 for item in budget_status if item.get('alert_level') == 'critical'),
+        }
+    except Exception:
+        return {
+            'current_month_spend': 0.0,
+            'monthly_spend': 0.0,
+            'by_service': {},
+            'by_day': {},
+            'projected_month_end': 0.0,
+            'budgets': [],
+            'budget_count': 0,
+            'over_budget_count': 0,
+        }
+
+
+def _governance_for(org_id: int) -> dict:
+    """Build org governance metrics from persisted policy state."""
+    try:
+        from app.models.governance import Policy, ComplianceCheck, PolicyStatus
+
+        policies = Policy.query.filter_by(organization_id=org_id).all()
+        active_policies = [policy for policy in policies if policy.status == PolicyStatus.ACTIVE]
+        compliance_checks = ComplianceCheck.query.join(
+            ComplianceCheck.policy
+        ).filter(
+            Policy.organization_id == org_id
+        ).all()
+
+        if compliance_checks:
+            passed_count = sum(1 for check in compliance_checks if check.status == 'passed')
+            compliance_score = int((passed_count / len(compliance_checks)) * 100)
+        else:
+            compliance_score = 100
+
+        return {
+            'policy_count': len(policies),
+            'active_policy_count': len(active_policies),
+            'compliance_check_count': len(compliance_checks),
+            'compliance_score': compliance_score,
+            'recent_checks': [
+                {
+                    'policy_id': check.policy_id,
+                    'resource_id': check.resource_id,
+                    'resource_type': check.resource_type,
+                    'checked_at': check.checked_at.isoformat() if check.checked_at else None,
+                    'status': getattr(check, 'status', 'unknown'),
+                }
+                for check in compliance_checks[:5]
+            ],
+        }
+    except Exception:
+        return {
+            'policy_count': 0,
+            'active_policy_count': 0,
+            'compliance_check_count': 0,
+            'compliance_score': 100,
+            'recent_checks': [],
+        }
+
+
+def _runtime_for(org_id: int) -> dict:
+    """Build current simulation/runtime state for recovery-oriented views."""
+    try:
+        from app import simulation_engine
+
+        state = simulation_engine.get_state(org_id) or {}
+        total_ticks = int(state.get('total_ticks', 0) or 0)
+        current_tick = int(state.get('current_tick', 0) or 0)
+        progress_pct = round((current_tick / total_ticks) * 100, 1) if total_ticks else 0.0
+        return {
+            'scenario_id': state.get('scenario_id'),
+            'is_running': bool(state.get('is_running', False)),
+            'current_tick': current_tick,
+            'total_ticks': total_ticks,
+            'progress_pct': progress_pct,
+            'dropped_requests': int(state.get('dropped_requests', 0) or 0),
+            'vm_count': int(state.get('vm_count', 0) or 0),
+            'recovery_state': 'running' if state.get('is_running') else 'idle',
+        }
+    except Exception:
+        return {
+            'scenario_id': None,
+            'is_running': False,
+            'current_tick': 0,
+            'total_ticks': 0,
+            'progress_pct': 0.0,
+            'dropped_requests': 0,
+            'vm_count': 0,
+            'recovery_state': 'idle',
+        }
+
+
+def _telemetry_for(org_id: int) -> dict:
+    """Build dashboard telemetry series from the simulator when available."""
+    try:
+        from flask import current_app
+
+        simulator = getattr(current_app, 'simulator', None)
+        if simulator and hasattr(simulator, 'get_dashboard_snapshot'):
+            telemetry = simulator.get_dashboard_snapshot(org_id) or {}
+            return {
+                'cost_trend': telemetry.get('cost_trend', []),
+                'utilization_trend': telemetry.get('utilization_trend', []),
+                'recent_activity': telemetry.get('recent_activity', []),
+                'workload_explanation': telemetry.get('workload_explanation', {}),
+            }
+    except Exception:
+        pass
+
+    return {
+        'cost_trend': [],
+        'utilization_trend': [],
+        'recent_activity': [],
+        'workload_explanation': {},
+    }
 
 
 def get_org_snapshot(org_id: int, use_cache: bool = True) -> dict:
@@ -197,6 +403,8 @@ def _compute_org_snapshot(org_id: int) -> dict:
     bpi: float = 0.0
     target_bpi: float = 0.0
     avg_service_time_ms: float = 5.0
+
+    current_hourly_cost = sum(float(vm.hourly_rate or 0) for vm in running_vms)
 
     # Compute metrics only from valid VMs
     if valid_vms:
@@ -407,7 +615,12 @@ def _compute_org_snapshot(org_id: int) -> dict:
             compute_desired_capacity,
         )
 
-        state = scaling_state.get(org_id, {"last_action_time": 0, "capacity": 1})
+        state = scaling_state.get(org_id, {"last_action_time": 0, "capacity": max(1, vm_count)})
+        # Source of truth sync: align desired capacity with actual running VMs if user manually intervened
+        if state["capacity"] != vm_count:
+            state["capacity"] = max(1, vm_count)
+            scaling_state[org_id] = state
+
         current_time = time.time()
 
         # Retrieve org-level avg service time from the workload snapshot so
@@ -440,6 +653,14 @@ def _compute_org_snapshot(org_id: int) -> dict:
             actions = []
             action_taken = False
 
+            # ── Debug: queue calculation ────────────────────────────────────────
+            print(
+                f"[CONTROL_PLANE:AUTOSCALE] org={org_id} "
+                f"bpi={bpi:.2f} target_bpi={target_bpi:.2f} "
+                f"queue_total_ms={queue_total_ms:.1f} p95_latency={p95_latency_ms:.1f}ms "
+                f"vm_count={vm_count} capacity={state['capacity']}"
+            )
+
             if bpi > target_bpi and state["capacity"] < _CAPACITY_MAX:
                 # SCALE OUT — proportional to overload.
                 # desired = ceil(backlog_requests / target_bpi)
@@ -454,7 +675,7 @@ def _compute_org_snapshot(org_id: int) -> dict:
                 # Execute: create actual VMs in the database.
                 created = 0
                 instance_type = running_vms[0].instance_type if running_vms else "t2.medium"
-                base_rps = int(running_vms[0].requests_per_second or 50) if running_vms else 50
+                base_rps = 50
                 pattern = (running_vms[0].workload_pattern or "steady") if running_vms else "steady"
                 for _ in range(actual_step):
                     try:
@@ -469,6 +690,12 @@ def _compute_org_snapshot(org_id: int) -> dict:
                     f"BPI={bpi:.1f} > target={target_bpi:.1f} — "
                     f"queue={queue_total_ms:.0f}ms, p95={p95_latency_ms:.0f}ms, "
                     f"drops={dropped_total}, +{created} instance(s) created"
+                )
+                print(
+                    f"[CONTROL_PLANE:SCALE_OUT] org={org_id} "
+                    f"created={created} decision=bpi_exceeded "
+                    f"bpi={bpi:.2f}>target={target_bpi:.2f} "
+                    f"queue={queue_total_ms:.0f}ms new_capacity={state['capacity']}/{_GLOBAL_MAX_VMS}"
                 )
                 actions.append({
                     "type": "scale_up",
@@ -497,6 +724,12 @@ def _compute_org_snapshot(org_id: int) -> dict:
                     f"BPI={bpi:.1f} < target×0.7={target_bpi * _SCALE_IN_BPI_RATIO:.1f} — "
                     f"queue stable, latency/drops OK"
                     + (" — 1 instance terminated" if terminated else " — no autoscale VM to terminate")
+                )
+                print(
+                    f"[CONTROL_PLANE:SCALE_IN] org={org_id} "
+                    f"terminated={terminated} decision=bpi_below_threshold "
+                    f"bpi={bpi:.2f}<target*0.7={target_bpi * _SCALE_IN_BPI_RATIO:.2f} "
+                    f"new_capacity={state['capacity']}/{_GLOBAL_MAX_VMS}"
                 )
                 actions.append({
                     "type": "scale_down",
@@ -618,7 +851,7 @@ def _compute_org_snapshot(org_id: int) -> dict:
         alert_count = 0
         transitions = []
         actions = []
-        capacity = 1
+        capacity = running_vms_count
         learning_insight = {
             "title": "System stable",
             "what_happened": "No valid metrics available",
@@ -641,7 +874,7 @@ def _compute_org_snapshot(org_id: int) -> dict:
         alert_count = 0
         transitions = []
         actions = []
-        capacity = 1
+        capacity = running_vms_count
         learning_insight = {
             "title": "System stable",
             "what_happened": "No resources detected",
@@ -652,6 +885,18 @@ def _compute_org_snapshot(org_id: int) -> dict:
     # Module 3/4: attach workload snapshot + topology without removing keys.
     workload_block = _workload_snapshot_for(org_id) if running_vms_count else {}
     topology_block = _topology_for(org_id)
+    security_block = _security_for(org_id)
+    cost_block = _cost_for(org_id)
+    governance_block = _governance_for(org_id)
+    runtime_block = _runtime_for(org_id)
+    telemetry_block = _telemetry_for(org_id)
+
+    active_threats = security_block.get('active_threats', 0)
+    security_score = security_block.get('security_score', 100)
+    compliance_score = governance_block.get('compliance_score', 100)
+    current_month_spend = cost_block.get('current_month_spend', 0.0)
+    monthly_spend = cost_block.get('monthly_spend', 0.0)
+    budgets = cost_block.get('budgets', [])
 
     return {
         'total_vms': total_vms,
@@ -688,6 +933,25 @@ def _compute_org_snapshot(org_id: int) -> dict:
         'workload': workload_block,
         # Module 1 extension
         'topology': topology_block,
+        'security': security_block,
+        'costs': cost_block,
+        'governance': governance_block,
+        'runtime': runtime_block,
+        'cost_trend': telemetry_block.get('cost_trend', []),
+        'utilization_trend': telemetry_block.get('utilization_trend', []),
+        'recent_activity': telemetry_block.get('recent_activity', []),
+        'workload_explanation': telemetry_block.get('workload_explanation', {}),
+        'recovery_state': runtime_block.get('recovery_state', 'idle'),
+        'active_threats': active_threats,
+        'security_score': security_score,
+        'compliance_score': compliance_score,
+        'current_month_spend': current_month_spend,
+        'monthly_spend': monthly_spend,
+        'budgets': budgets,
+        'current_hourly_cost': round(current_hourly_cost, 4),
+        'cost_trend': [],
+        'utilization_trend': [],
+        'recent_activity': [],
     }
 
 
@@ -729,4 +993,17 @@ def run_control_plane_loop():
 def start_control_plane_loop():
     """Launch run_control_plane_loop as a SocketIO background task (idempotent)."""
     from app import socketio
-    socketio.start_background_task(run_control_plane_loop)
+    global _control_plane_task
+    with _control_plane_lock:
+        if _control_plane_task is not None:
+            task_alive = getattr(_control_plane_task, 'is_alive', None)
+            if callable(task_alive):
+                try:
+                    if task_alive():
+                        return
+                except Exception:
+                    pass
+            dead_flag = getattr(_control_plane_task, 'dead', None)
+            if dead_flag is not None and not dead_flag:
+                return
+        _control_plane_task = socketio.start_background_task(run_control_plane_loop)

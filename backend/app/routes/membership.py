@@ -74,14 +74,7 @@ def _resolve_membership(user_id, requested_org_id=None):
     if member:
         return member
 
-    user = User.query.get(user_id)
-    if not user:
-        return None
-
-    _, member, created = ensure_default_organization_membership(user)
-    if created:
-        db.session.commit()
-    return member
+    return None
 
 
 @membership_bp.route('/plans', methods=['GET'])

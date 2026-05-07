@@ -65,12 +65,59 @@ def reset_system():
                 sim._vm_des.clear()
                 
         # Also clear control_plane cache
-        from app.services.control_plane import _snapshot_cache, _state_store
         _snapshot_cache.clear()
-        _state_store.clear()
+        try:
+            from app.services.control_plane import _state_store
+            _state_store.clear()
+        except ImportError:
+            pass
 
         return jsonify({'status': 'success', 'message': 'System safely reset to 1 VM.'}), 200
 
     except Exception as e:
         db.session.rollback()
         return jsonify({'status': 'error', 'error': {'message': str(e)}}), 500
+
+@admin_bp.route('/analytics/organization/<int:org_id>', methods=['GET'])
+@jwt_required()
+def get_org_analytics(org_id):
+    """Organization-level analytics for admins to view student performance."""
+    from app.models.progress import UserProgress
+    from app.models.organization import OrganizationMember
+    from app.models.user import User
+
+    # Only accessible by organization admins/owners
+    from flask_jwt_extended import get_jwt_identity
+    user_id = get_jwt_identity()
+    member = OrganizationMember.query.filter_by(organization_id=org_id, user_id=user_id).first()
+    if not member or member.role not in ['admin', 'owner']:
+        return jsonify({'error': 'Access denied'}), 403
+
+    students_progress = UserProgress.query.filter_by(org_id=org_id).all()
+    
+    analytics = []
+    for p in students_progress:
+        user = User.query.get(p.user_id)
+        if not user:
+            continue
+        analytics.append({
+            'user_id': user.id,
+            'name': f"{user.first_name} {user.last_name}",
+            'email': user.email,
+            'level': p.level,
+            'level_title': p.level_title,
+            'total_points': p.total_points,
+            'badges': p.badges or [],
+            'scenarios_completed': len(p.scenarios_completed or []),
+            'vms_created': p.vms_created,
+            'attacks_simulated': p.attacks_simulated
+        })
+
+    return jsonify({
+        'status': 'success',
+        'data': {
+            'organization_id': org_id,
+            'total_students': len(analytics),
+            'students': analytics
+        }
+    }), 200

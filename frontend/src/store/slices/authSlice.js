@@ -73,13 +73,10 @@ const authSlice = createSlice({
       })
       .addCase(login.fulfilled, (state, action) => {
         state.loading = false;
-        state.user = action.payload.user;
+        state.user = action.payload.user || null;
         state.token = action.payload.access_token;
         state.refreshToken = action.payload.refresh_token;
         state.isAuthenticated = true;
-        if (action.payload.organizations?.length > 0) {
-          localStorage.setItem('activeOrg', JSON.stringify(action.payload.organizations[0]));
-        }
       })
       .addCase(login.rejected, (state, action) => {
         state.loading = false;
